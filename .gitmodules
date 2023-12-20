@@ -1,0 +1,6 @@
+[submodule "modules/hdl.cpp"]
+	path = modules/hdl.cpp
+	url = https://github.com/can-lehmann/hdl.cpp.git
+[submodule "modules/unittest.cpp"]
+	path = modules/unittest.cpp
+	url = https://github.com/can-lehmann/unittest.cpp

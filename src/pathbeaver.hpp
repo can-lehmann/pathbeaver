@@ -27,6 +27,8 @@
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Constants.h>
 
+#include <llvm/Analysis/PostDominators.h>
+
 #include "../modules/hdl.cpp/hdl.hpp"
 
 #define throw_error(Error, msg) {\
@@ -38,6 +40,12 @@
 #define llvm_match(Type, into, value) llvm::Type* into = llvm::dyn_cast<llvm::Type>(value)
 
 namespace pathbeaver {
+  template <class T>
+  void move_into(T& into, T&& value) {
+    into.~T();
+    new(&into) T(std::move(value));
+  }
+
   class Error: public std::runtime_error {
     using std::runtime_error::runtime_error;
   };
@@ -63,6 +71,7 @@ namespace pathbeaver {
     struct StackFrame {
       hdl::Module& module;
       llvm::Instruction* pc = nullptr;
+      std::vector<llvm::BasicBlock*> joins;
       std::unordered_map<llvm::Value*, Value> values;
       
       StackFrame(hdl::Module& _module): module(_module) {}
@@ -89,6 +98,10 @@ namespace pathbeaver {
       
       void next() {
         pc = pc->getNextNonDebugInstruction();
+      }
+      
+      bool is_join(llvm::BasicBlock* block) {
+        return joins.size() > 0 && joins.back() == block;
       }
     };
     
@@ -169,7 +182,7 @@ namespace pathbeaver {
       Trace trace = traces.back();
       if (traces.size() > 1) {
         for (size_t it = traces.size() - 1; it-- > 0; ) {
-          if (trace.merge_inplace(traces[it])) {
+          if (!trace.merge_inplace(traces[it])) {
             return {};
           }
         }
@@ -180,6 +193,8 @@ namespace pathbeaver {
     hdl::Module& module() const { return _module; }
     const Requirements& requirements() const { return _requirements; }
     const std::vector<StackFrame>& stack() const { return _stack; }
+    
+    llvm::Instruction* current_inst() const { return _stack.back().pc; }
     
     Value toplevel_return_value() const {
       if (_stack.size() != 1 || _stack[0].pc != nullptr) {
@@ -297,12 +312,15 @@ namespace pathbeaver {
     }
     
     enum class StopReason {
-      ToplevelReturn, Branch
+      ToplevelReturn, Branch, Join
     };
     
     StopReason trace_until_branch() {
       while (true) {
-        llvm::Instruction* inst = _stack.back().pc;
+        llvm::Instruction* inst = current_inst();
+        if (_stack.back().is_join(inst->getParent())) {
+          return StopReason::Join;
+        }
         inst->print(llvm::outs());
         llvm::outs() << '\n';
         
@@ -384,6 +402,27 @@ namespace pathbeaver {
       return traces;
     }
     
+    static llvm::BasicBlock* find_join_block(const std::vector<Trace>& traces) {
+      if (traces.size() == 0) {
+        return nullptr;
+      }
+      
+      llvm::Function* function = traces[0].current_inst()->getParent()->getParent();
+      llvm::PostDominatorTree postdom(*function);
+      
+      llvm::BasicBlock* join = traces[0].current_inst()->getParent();
+      join->printAsOperand(llvm::outs());
+      llvm::outs() << '\n';
+      for (size_t it = 1; it < traces.size(); it++) {
+        llvm::BasicBlock* block = traces[it].current_inst()->getParent();
+        block->printAsOperand(llvm::outs());
+        llvm::outs() << '\n';
+        join = postdom.findNearestCommonDominator(join, block);
+      }
+      
+      return join;
+    }
+    
     std::vector<Trace> trace() {
       std::vector<Trace> traces;
       
@@ -395,7 +434,8 @@ namespace pathbeaver {
         
         StopReason reason = trace.trace_until_branch();
         if (reason == StopReason::Branch) {
-          for (const Trace& option : trace.split_at_branch()) {
+          std::vector<Trace> options = trace.split_at_branch();
+          for (const Trace& option : options) {
             open.push_back(option);
           }
         } else {
@@ -404,6 +444,43 @@ namespace pathbeaver {
       }
       
       return traces;
+    }
+    
+    Trace trace_recursive() {
+      std::cout << "Trace" << std::endl;
+      Trace trace = *this;
+      StopReason reason = trace.trace_until_branch();
+      while (reason == StopReason::Branch) {
+        std::vector<Trace> options = trace.split_at_branch();
+        llvm::BasicBlock* join = find_join_block(options);
+        
+        llvm::outs() << "Branch. Rejoin at: ";
+        join->printAsOperand(llvm::outs());
+        llvm::outs() << '\n';
+        
+        std::vector<Trace> joined;
+        for (Trace& option : options) {
+          if (join != nullptr) {
+            option._stack.back().joins.push_back(join);
+          }
+          Trace done = option.trace_recursive();
+          if (join != nullptr) {
+            if (done._stack.back().joins.back() != join) {
+              throw_error(Error, "");
+            }
+            done._stack.back().joins.pop_back();
+          }
+          joined.push_back(done);
+        }
+        
+        std::cout << "Rejoined" << std::endl;
+        
+        std::optional<Trace> merged = Trace::merge(joined);
+        move_into(trace, std::move(merged.value()));
+        reason = trace.trace_until_branch();
+      }
+      
+      return trace;
     }
     
     bool merge_inplace(const Trace& other) {
@@ -419,6 +496,16 @@ namespace pathbeaver {
         
         if (frame.pc != other_frame.pc) {
           return false;
+        }
+        
+        if (frame.joins.size() != other_frame.joins.size()) {
+          return false;
+        }
+        
+        for (size_t it = 0; it < frame.joins.size(); it++) {
+          if (frame.joins[it] != other_frame.joins[it]) {
+            return false;
+          }
         }
         
         for (auto iter = frame.values.begin(); iter != frame.values.end(); ) {

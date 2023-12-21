@@ -45,16 +45,18 @@ int main(int argc, const char** argv) {
   {
     llvm::Function* function = llvm_module->getFunction("popcount_simple");
     pathbeaver::Trace initial_trace = pathbeaver::Trace::call(module, function, {x});
-    std::vector<pathbeaver::Trace> traces = initial_trace.trace();
-    pathbeaver::Trace merged = pathbeaver::Trace::merge(traces).value();
+    pathbeaver::Trace merged = initial_trace.trace_recursive();
+    //std::vector<pathbeaver::Trace> traces = initial_trace.trace();
+    //pathbeaver::Trace merged = pathbeaver::Trace::merge(traces).value();
     ret_a = merged.toplevel_return_value().primitive();
   }
   
   {
     llvm::Function* function = llvm_module->getFunction("popcount_fast");
     pathbeaver::Trace initial_trace = pathbeaver::Trace::call(module, function, {x});
-    std::vector<pathbeaver::Trace> traces = initial_trace.trace();
-    pathbeaver::Trace merged = pathbeaver::Trace::merge(traces).value();
+    pathbeaver::Trace merged = initial_trace.trace_recursive();
+    //std::vector<pathbeaver::Trace> traces = initial_trace.trace();
+    //pathbeaver::Trace merged = pathbeaver::Trace::merge(traces).value();
     ret_b = merged.toplevel_return_value().primitive();
   }
   

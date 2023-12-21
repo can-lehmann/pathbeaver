@@ -265,6 +265,37 @@ namespace pathbeaver {
       frame.set(cmp, Value(result));
     }
     
+    void trace_cast(llvm::CastInst* cast) {
+      StackFrame& frame = _stack.back();
+      Value value = frame[cast->getOperand(0)];
+      size_t dest_width = cast->getDestTy()->getPrimitiveSizeInBits();
+      size_t src_width = cast->getSrcTy()->getPrimitiveSizeInBits();
+      
+      if (llvm_match(ZExtInst, z_ext, cast)) {
+        size_t delta = dest_width - src_width;
+        frame.set(cast, Value(_module.op(hdl::Op::Kind::Concat, {
+          _module.constant(hdl::BitString(delta)),
+          value.primitive()
+        })));
+      } else if (llvm_match(SExtInst, s_ext, cast)) {
+        size_t delta = dest_width - src_width;
+        frame.set(cast, Value(_module.op(hdl::Op::Kind::Concat, {
+          _module.op(hdl::Op::Kind::Select, {
+            _module.op(hdl::Op::Kind::Slice, {
+              value.primitive(),
+              _module.constant(hdl::BitString::from_uint(src_width - 1)),
+              _module.constant(hdl::BitString::from_uint(1))
+            }),
+            _module.constant(~hdl::BitString(delta)),
+            _module.constant(hdl::BitString(delta))
+          }),
+          value.primitive()
+        })));
+      } else {
+        throw_error(Error, "Cast instruction " << cast->getOpcodeName() << " is not implemented");
+      }
+    }
+    
     enum class StopReason {
       ToplevelReturn, Branch
     };
@@ -319,6 +350,9 @@ namespace pathbeaver {
           _stack.back().next();
         } else if (llvm_match(CmpInst, cmp, inst)) {
           trace_cmp(cmp);
+          _stack.back().next();
+        } else if (llvm_match(CastInst, cast, inst)) {
+          trace_cast(cast);
           _stack.back().next();
         } else {
           throw_error(Error, "Instruction " << inst->getOpcodeName() << " is not supported.");

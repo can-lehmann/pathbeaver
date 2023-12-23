@@ -33,6 +33,7 @@
 #include <llvm/Analysis/PostDominators.h>
 
 #include "../modules/hdl.cpp/hdl.hpp"
+#include "../modules/hdl.cpp/hdl_analysis.hpp"
 
 #define throw_error(Error, msg) {\
   std::ostringstream message_stream; \
@@ -53,101 +54,65 @@ namespace pathbeaver {
     using std::runtime_error::runtime_error;
   };
   
-  using Id = uint64_t;
-  
   class Value {
   public:
     enum class Kind {
-      Primitive, Pointer, Unknown, Select
+      Primitive
     };
     
-    struct Unknown {
-      size_t size = 0;
-      Unknown(size_t _size): size(_size) {}
-    };
-    
-    struct Pointer {
-      Id id = 0;
-      hdl::Value* offset = nullptr;
-      
-      Pointer(Id _id, hdl::Value* _offset): id(_id), offset(_offset) {}
-    };
-    
-    struct Select {
-      hdl::Value* cond = nullptr;
-      std::shared_ptr<Value> a;
-      std::shared_ptr<Value> b;
-      
-      Select(hdl::Value* _cond,
-             const std::shared_ptr<Value>& _a,
-             const std::shared_ptr<Value>& _b):
-        cond(_cond), a(_a), b(_b) {}
-    };
   private:
-    std::variant<hdl::Value*, Pointer, Unknown, Select> _value;
+    std::variant<hdl::Value*> _value;
   public:
     Value(hdl::Value* value): _value(value) {}
-    Value(const Pointer& value): _value(value) {}
-    Value(const Unknown& value): _value(value) {}
-    Value(const Select& value): _value(value) {}
     
-    static Value select(hdl::Value* cond, const Value& a, const Value& b, hdl::Module& module) {
-      if (hdl::Constant* constant = dynamic_cast<hdl::Constant*>(cond)) {
-        if (constant->value.is_zero()) {
-          return b;
-        } else {
-          return a;
-        }
-      } else if (a.kind() == Kind::Primitive && b.kind() == Kind::Primitive) {
+  private:
+    static hdl::Value* prop_concat(hdl::Value* high, hdl::Value* low, hdl::Module& module) {
+      hdl::Op* high_op = dynamic_cast<hdl::Op*>(high);
+      hdl::Op* low_op = dynamic_cast<hdl::Op*>(low);
+      if (high_op &&
+          low_op &&
+          high_op->kind == hdl::Op::Kind::Select &&
+          low_op->kind == hdl::Op::Kind::Select &&
+          low_op->args[0] == high_op->args[0]) {
         return module.op(hdl::Op::Kind::Select, {
-          cond,
-          a.primitive(),
-          b.primitive()
+          low_op->args[0],
+          prop_concat(high_op->args[1], low_op->args[1], module),
+          prop_concat(high_op->args[2], low_op->args[2], module)
         });
-      } else {
-        return Value(Select(cond, std::make_shared<Value>(a), std::make_shared<Value>(b)));
       }
+      return module.op(hdl::Op::Kind::Concat, {high, low});
     }
     
+  public:
     static Value from_bytes(llvm::Type* type,
                             const llvm::DataLayout& data_layout,
-                            const std::vector<Value>& bytes,
+                            const std::vector<hdl::Value*>& bytes,
                             hdl::Module& module) {
       size_t size = data_layout.getTypeStoreSize(type);
-      switch (bytes[0].kind()) {
-        case Kind::Primitive: {
-          hdl::Value* value = nullptr;
-          for (size_t offset = 0; offset < size; offset++) {
-            hdl::Value* byte = bytes[offset].primitive();
-            
-            if (value == nullptr) {
-              value = byte;
-            } else {
-              if (data_layout.isLittleEndian()) {
-                value = module.op(hdl::Op::Kind::Concat, {byte, value});
-              } else {
-                value = module.op(hdl::Op::Kind::Concat, {value, byte});
-              }
-            }
+      hdl::Value* value = nullptr;
+      for (size_t offset = 0; offset < size; offset++) {
+        hdl::Value* byte = bytes[offset];
+        
+        if (value == nullptr) {
+          value = byte;
+        } else {
+          if (data_layout.isLittleEndian()) {
+            value = prop_concat(byte, value, module);
+          } else {
+            value = prop_concat(value, byte, module);
           }
-          return Value(value);
         }
-        break;
-        case Kind::Pointer: return bytes[0]; break;
-        case Kind::Unknown: return Value(Unknown(size)); break;
-        case Kind::Select: throw_error(Error, ""); break;
       }
+      return Value(value);
     }
     
     Kind kind() const { return Kind(_value.index()); }
     hdl::Value* primitive() const { return std::get<hdl::Value*>(_value); }
-    Pointer pointer() const { return std::get<Pointer>(_value); }
-    Select select() const { return std::get<Select>(_value); }
     
-    std::map<size_t, Value> to_bytes(llvm::Type* type,
-                                     const llvm::DataLayout& data_layout,
-                                     hdl::Module& module) {
-      std::map<size_t, Value> layout;
+    std::map<size_t, hdl::Value*> to_bytes(llvm::Type* type,
+                                           const llvm::DataLayout& data_layout,
+                                           hdl::Module& module) {
+      std::map<size_t, hdl::Value*> layout;
       size_t size = data_layout.getTypeStoreSize(type);
       switch (kind()) {
         case Kind::Primitive:
@@ -158,94 +123,174 @@ namespace pathbeaver {
               module.constant(hdl::BitString::from_uint(8))
             });
             if (data_layout.isLittleEndian()) {
-              layout.insert({offset, Value(byte)});
+              layout.insert({offset, byte});
             } else {
-              layout.insert({size - offset - 1, Value(byte)});
+              layout.insert({size - offset - 1, byte});
             }
           }
-        break;
-        case Kind::Pointer:
-          for (size_t offset = 0; offset < size; offset++) {
-            layout.insert({offset, *this});
-          }
-        break;
-        case Kind::Unknown:
-          for (size_t offset = 0; offset < size; offset++) {
-            layout.insert({offset, Value(Unknown(1))});
-          }
-        break;
-        case Kind::Select:
-          throw_error(Error, "");
         break;
       }
       return layout;
     }
   };
   
+  using AffineValue = hdl::analysis::AffineValue;
+  
   class Memory {
   public:
     struct Write {
       hdl::Value* enable = nullptr;
-      hdl::Value* address = nullptr;
-      Value value;
+      AffineValue offset = nullptr;
+      hdl::Value* value = nullptr;
       
-      Write(hdl::Value* _enable, hdl::Value* _address, const Value& _value):
-        enable(_enable), address(_address), value(_value) {}
+      Write(hdl::Value* _enable, AffineValue _offset, hdl::Value* _value):
+        enable(_enable), offset(_offset), value(_value) {}
     };
     
     struct Chunk {
       hdl::Module* module = nullptr;
+      hdl::Unknown* address = nullptr;
       hdl::Value* size = nullptr;
+      
+      std::map<uint64_t, hdl::Value*> base;
       std::vector<Write> writes;
       
-      Chunk(hdl::Module* _module, hdl::Value* _size): module(_module), size(_size) {}
+      Chunk(hdl::Module* _module, hdl::Unknown* _address, hdl::Value* _size):
+        module(_module), address(_address), size(_size) {}
       
-      void store(hdl::Value* address, Value value) {
-        writes.emplace_back(
-          module->constant(hdl::BitString::from_bool(true)),
-          address,
-          value
-        );
+      void store(hdl::Value* enable, const AffineValue& offset, hdl::Value* value) {
+        if (offset.is_constant()) {
+          if (base.find(offset.constant.as_uint64()) == base.end()) {
+            base[offset.constant.as_uint64()] = module->unknown(8);
+          }
+          base[offset.constant.as_uint64()] = module->op(hdl::Op::Kind::Select, {
+            enable, value, base.at(offset.constant.as_uint64())
+          });
+        } else {
+          throw_error(Error, "");
+          writes.emplace_back(enable, offset, value);
+        }
       }
       
-      Value load(hdl::Value* address) {
-        Value result(Value::Unknown(1));
-        for (const Write& write : writes) {
-          result = Value::select(
-            module->op(hdl::Op::Kind::And, {
-              write.enable,
-              module->op(hdl::Op::Kind::Eq, {
-                address,
-                write.address
-              })
-            }),
-            write.value,
-            result,
-            *module
-          );
+      void store(const AffineValue& offset, hdl::Value* value) {
+        store(module->constant(hdl::BitString::from_bool(true)), offset, value);
+      }
+      
+      hdl::Value* load(const AffineValue& offset) {
+        if (offset.is_constant()) {
+          if (base.find(offset.constant.as_uint64()) == base.end()) {
+            base[offset.constant.as_uint64()] = module->unknown(8);
+          }
+          return base.at(offset.constant.as_uint64());
+        } else {
+          throw_error(Error, "");
+          
+          hdl::Value* result = module->unknown(8);
+          for (const Write& write : writes) {
+            result = module->op(hdl::Op::Kind::Select, {
+              module->op(hdl::Op::Kind::And, {
+                write.enable,
+                module->op(hdl::Op::Kind::Eq, {
+                  (offset - write.offset).build(*module),
+                  module->constant(hdl::BitString(offset.width()))
+                })
+              }),
+              write.value,
+              result
+            });
+          }
+          return result;
         }
-        return result;
+      }
+      
+      bool merge_inplace(const Chunk& other_chunk, hdl::Value* cond) {
+        hdl::Value* not_cond = module->op(hdl::Op::Kind::Not, {cond});
+        for (const auto& [offset, value] : other_chunk.base) {
+          store(not_cond, AffineValue(hdl::BitString::from_uint(offset).truncate(address->width)), value);
+        }
+        
+        /*for (const Write& write : other_chunk.writes) {
+          hdl::Value* enable = module->op(hdl::Op::Kind::And, {write.enable, not_cond});
+          store(enable, write.offset, write.value);
+        }*/
+        
+        return true;
       }
     };
   private:
     hdl::Module* _module = nullptr;
-    Id _max_id = 0;
-    std::map<Id, Chunk> _chunks;
+    // Deallocated chunks remain in the map, but are assigned std::optional<Chunk>()
+    std::map<hdl::Unknown*, std::optional<Chunk>> _chunks;
   public:
     Memory(hdl::Module* module): _module(module) {}
     
-    Id alloc(hdl::Value* size) {
-      Id id = ++_max_id;
-      _chunks.insert({id, Chunk(_module, size)});
-      return id;
+    std::optional<Chunk>& operator[](hdl::Unknown* base_address) { return _chunks.at(base_address); }
+    const std::optional<Chunk>& operator[](hdl::Unknown* base_address) const { return _chunks.at(base_address); }
+    
+    hdl::Unknown* alloc(hdl::Value* size) {
+      hdl::Unknown* base_address = _module->unknown(size->width);
+      _chunks.insert({base_address, Chunk(_module, base_address, size)});
+      return base_address;
     }
     
-    void dealloc(Id id) {
-      _chunks.erase(id);
+    void dealloc(hdl::Unknown* base_address) {
+      _chunks[base_address] = std::optional<Chunk>();
     }
     
-    Chunk& operator[](Id id) { return _chunks.at(id); }
-    const Chunk& operator[](Id id) const { return _chunks.at(id); }
+    struct BaseOffset {
+      hdl::Unknown* base = nullptr;
+      AffineValue offset;
+      
+      BaseOffset(hdl::Unknown* _base, const AffineValue& _offset):
+        base(_base), offset(_offset) {}
+    };
+    
+    std::optional<BaseOffset> split_address(hdl::Value* address) {
+      AffineValue affine = AffineValue::build(address);
+      for (const auto& [value, factor] : affine.factors) {
+        if (hdl::Unknown* base = dynamic_cast<hdl::Unknown*>(value)) {
+          if (factor.as_uint64() == 1 && _chunks.find(base) != _chunks.end()) {
+            return BaseOffset(base, affine - AffineValue(base));
+          }
+        }
+      }
+      return {};
+    }
+    
+    hdl::Value* load(hdl::Value* address) {
+      std::optional<BaseOffset> split = split_address(address);
+      if (!split.has_value()) {
+        throw_error(Error, "TODO");
+      }
+      return _chunks.at(split.value().base).value().load(split.value().offset);
+    }
+    
+    void store(hdl::Value* address, hdl::Value* value) {
+      if (value->width != 8) {
+        throw_error(Error, "");
+      }
+      std::optional<BaseOffset> split = split_address(address);
+      if (!split.has_value()) {
+        throw_error(Error, "TODO");
+      }
+      _chunks.at(split.value().base).value().store(split.value().offset, value);
+    }
+    
+    bool merge_inplace(const Memory& other, hdl::Value* cond) {
+      for (const auto& [base_address, chunk] : other._chunks) {
+        if (_chunks.find(base_address) == _chunks.end()) {
+          _chunks.insert({base_address, chunk});
+        } else if (_chunks.at(base_address).has_value() != chunk.has_value()) {
+          return false;
+        } else if (chunk.has_value()) {
+          if (!_chunks.at(base_address).value().merge_inplace(chunk.value(), cond)) {
+            return false;
+          }
+        }
+      }
+      
+      return true;
+    }
   };
   
   class Trace {
@@ -255,7 +300,7 @@ namespace pathbeaver {
       llvm::Instruction* pc = nullptr;
       std::vector<llvm::BasicBlock*> joins;
       std::unordered_map<llvm::Value*, Value> values;
-      std::vector<Id> allocations;
+      std::vector<hdl::Unknown*> allocations;
       
       StackFrame(hdl::Module& _module): module(_module) {}
       
@@ -540,8 +585,8 @@ namespace pathbeaver {
         
         if (llvm_match(ReturnInst, ret, inst)) {
           StackFrame& callee_frame = _stack.back();
-          for (Id id : callee_frame.allocations) {
-            _memory.dealloc(id);
+          for (hdl::Unknown* base_address : callee_frame.allocations) {
+            _memory.dealloc(base_address);
           }
           
           if (_stack.size() == 1) {
@@ -570,7 +615,9 @@ namespace pathbeaver {
           Value cond = frame[select->getCondition()];
           Value a = frame[select->getTrueValue()];
           Value b = frame[select->getFalseValue()];
-          frame.set(inst, Value::select(cond.primitive(), a, b, _module));
+          frame.set(inst, _module.op(hdl::Op::Kind::Select, {
+            cond.primitive(), a.primitive(), b.primitive()
+          }));
           frame.next();
         } else if (llvm_match(AllocaInst, alloca, inst)) {
           StackFrame& frame = _stack.back();
@@ -584,44 +631,43 @@ namespace pathbeaver {
             resize_u(_module.constant(hdl::BitString::from_uint(alloc_size)), pointer_width),
             resize_u(array_size, pointer_width)
           );
-          Id id = _memory.alloc(size);
+          hdl::Unknown* base_address = _memory.alloc(size);
           
-          hdl::Value* offset = _module.constant(hdl::BitString(pointer_width));
-          frame.set(alloca, Value(Value::Pointer(id, offset)));
-          frame.allocations.push_back(id);
+          frame.set(alloca, base_address);
+          frame.allocations.push_back(base_address);
           _stack.back().next();
         } else if (llvm_match(StoreInst, store, inst)) {
           StackFrame& frame = _stack.back();
           Value value = frame[store->getValueOperand()];
-          Value::Pointer pointer = frame[store->getPointerOperand()].pointer();
+          hdl::Value* pointer = frame[store->getPointerOperand()].primitive();
           
           const llvm::DataLayout& data_layout = store->getModule()->getDataLayout();
-          std::map<size_t, Value> layout = value.to_bytes(store->getValueOperand()->getType(), data_layout, _module);
+          std::map<size_t, hdl::Value*> layout = value.to_bytes(store->getValueOperand()->getType(), data_layout, _module);
           for (const auto& [offset, byte] : layout) {
             hdl::Value* offset_value = _module.constant(hdl::BitString::from_uint(offset));
             hdl::Value* address = _module.op(hdl::Op::Kind::Add, {
-              pointer.offset,
-              resize_u(offset_value, pointer.offset->width)
+              pointer,
+              resize_u(offset_value, pointer->width)
             });
-            _memory[pointer.id].store(address, byte);
+            _memory.store(address, byte);
           }
           _stack.back().next();
         } else if (llvm_match(LoadInst, load, inst)) {
           StackFrame& frame = _stack.back();
-          Value::Pointer pointer = frame[load->getPointerOperand()].pointer();
+          hdl::Value* pointer = frame[load->getPointerOperand()].primitive();
           
           const llvm::DataLayout& data_layout = load->getModule()->getDataLayout();
           llvm::Type* type = load->getType();
           size_t size = data_layout.getTypeStoreSize(type);
-          std::vector<Value> bytes;
+          std::vector<hdl::Value*> bytes;
           bytes.reserve(size);
           for (size_t offset = 0; offset < size; offset++) {
             hdl::Value* offset_value = _module.constant(hdl::BitString::from_uint(offset));
             hdl::Value* address = _module.op(hdl::Op::Kind::Add, {
-              pointer.offset,
-              resize_u(offset_value, pointer.offset->width)
+              pointer,
+              resize_u(offset_value, pointer->width)
             });
-            bytes.push_back(_memory[pointer.id].load(address));
+            bytes.push_back(_memory.load(address));
           }
           
           frame.set(load, Value::from_bytes(type, data_layout, bytes, _module));
@@ -777,10 +823,19 @@ namespace pathbeaver {
             iter = frame.values.erase(iter);
           } else {
             const Value& other_value = other_frame.values.at(llvm_value);
-            value = Value::select(cond, value, other_value, _module);
+            if (value.kind() != other_value.kind()) {
+              return false;
+            }
+            value = _module.op(hdl::Op::Kind::Select, {
+              cond, value.primitive(), other_value.primitive()
+            });
             iter++;
           }
         }
+      }
+      
+      if (!_memory.merge_inplace(other._memory, cond)) {
+        return false;
       }
       
       _requirements = _requirements.merge(other._requirements);

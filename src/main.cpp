@@ -49,6 +49,7 @@ int main(int argc, const char** argv) {
     //std::vector<pathbeaver::Trace> traces = initial_trace.trace();
     //pathbeaver::Trace merged = pathbeaver::Trace::merge(traces).value();
     ret_a = merged.toplevel_return_value().primitive();
+    module.output("popcount_simple", ret_a);
   }
   
   {
@@ -58,7 +59,11 @@ int main(int argc, const char** argv) {
     //std::vector<pathbeaver::Trace> traces = initial_trace.trace();
     //pathbeaver::Trace merged = pathbeaver::Trace::merge(traces).value();
     ret_b = merged.toplevel_return_value().primitive();
+    module.output("popcount_fast", ret_b);
   }
+  
+  hdl::graphviz::Printer printer(module);
+  printer.save("graph.gv");
   
   z3::context context;
   z3::solver solver(context);

@@ -28,6 +28,7 @@
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Instruction.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/Constants.h>
 
 #include <llvm/Analysis/PostDominators.h>
@@ -45,9 +46,17 @@
 
 namespace pathbeaver {
   template <class T>
-  void move_into(T& into, T&& value) {
+  inline void move_into(T& into, T&& value) {
     into.~T();
     new(&into) T(std::move(value));
+  }
+  
+  inline hdl::BitString ap_int_to_bit_string(const llvm::APInt& ap_int) {
+    hdl::BitString bit_string(ap_int.getBitWidth());
+    for (size_t it = 0; it < bit_string.width(); it++) {
+      bit_string.set(it, ap_int[it]);
+    }
+    return bit_string;
   }
 
   class Error: public std::runtime_error {
@@ -57,13 +66,17 @@ namespace pathbeaver {
   class Value {
   public:
     enum class Kind {
-      Primitive
+      Primitive, Array
     };
     
+    struct Array: public std::vector<Value> {
+      using std::vector<Value>::vector;
+    };
   private:
-    std::variant<hdl::Value*> _value;
+    std::variant<hdl::Value*, Array> _value;
   public:
     Value(hdl::Value* value): _value(value) {}
+    Value(const Array& value): _value(value) {}
     
   private:
     static hdl::Value* prop_concat(hdl::Value* high, hdl::Value* low, hdl::Module& module) {
@@ -108,29 +121,56 @@ namespace pathbeaver {
     
     Kind kind() const { return Kind(_value.index()); }
     hdl::Value* primitive() const { return std::get<hdl::Value*>(_value); }
+    const Array& array() const { return std::get<Array>(_value); }
     
     std::map<size_t, hdl::Value*> to_bytes(llvm::Type* type,
                                            const llvm::DataLayout& data_layout,
-                                           hdl::Module& module) {
+                                           hdl::Module& module) const {
       std::map<size_t, hdl::Value*> layout;
-      size_t size = data_layout.getTypeStoreSize(type);
+      to_bytes(type, layout, 0, data_layout, module);
+      return layout;
+    }
+    
+    void to_bytes(llvm::Type* type,
+                  std::map<size_t, hdl::Value*>& layout,
+                  size_t offset,
+                  const llvm::DataLayout& data_layout,
+                  hdl::Module& module) const {
       switch (kind()) {
-        case Kind::Primitive:
-          for (size_t offset = 0; offset < size; offset++) {
+        case Kind::Primitive: {
+          size_t size = data_layout.getTypeStoreSize(type);
+          for (size_t it = 0; it < size; it++) {
             hdl::Value* byte = module.op(hdl::Op::Kind::Slice, {
               primitive(),
-              module.constant(hdl::BitString::from_uint(offset * 8)),
+              module.constant(hdl::BitString::from_uint(it * 8)),
               module.constant(hdl::BitString::from_uint(8))
             });
             if (data_layout.isLittleEndian()) {
-              layout.insert({offset, byte});
+              layout.insert({offset + it, byte});
             } else {
-              layout.insert({size - offset - 1, byte});
+              layout.insert({offset + (size - it - 1), byte});
             }
           }
+        }
+        break;
+        case Kind::Array: {
+          llvm_match(ArrayType, array_type, type);
+          size_t size = data_layout.getTypeAllocSize(array_type->getElementType());
+          for (size_t it = 0; it < array().size(); it++) {
+            array()[it].to_bytes(
+              array_type->getElementType(),
+              layout,
+              offset + it * size,
+              data_layout,
+              module
+            );
+          }
+        }
+        break;
+        default:
+          throw_error(Error, "Not implemented");
         break;
       }
-      return layout;
     }
   };
   
@@ -163,6 +203,11 @@ namespace pathbeaver {
           if (base.find(offset.constant.as_uint64()) == base.end()) {
             base[offset.constant.as_uint64()] = module->unknown(8);
           }
+          std::cout << "store: " << offset.constant.as_uint64();
+          if (hdl::Constant* constant = dynamic_cast<hdl::Constant*>(value)) {
+            std::cout << " value: " << constant->value;
+          }
+          std::cout << std::endl;
           base[offset.constant.as_uint64()] = module->op(hdl::Op::Kind::Select, {
             enable, value, base.at(offset.constant.as_uint64())
           });
@@ -276,6 +321,27 @@ namespace pathbeaver {
       _chunks.at(split.value().base).value().store(split.value().offset, value);
     }
     
+    hdl::Value* load_all(hdl::Unknown* base_address) {
+      Chunk& chunk = _chunks.at(base_address).value();
+      if (hdl::Constant* constant_size = dynamic_cast<hdl::Constant*>(chunk.size)) {
+        size_t size = constant_size->value.as_uint64();
+        hdl::Value* result = nullptr;
+        for (size_t it = 0; it < size; it++) {
+          AffineValue offset(hdl::BitString::from_uint(it).truncate(base_address->width));
+          hdl::Value* byte = chunk.load(offset);
+          
+          if (result == nullptr) {
+            result = byte;
+          } else {
+            result = _module->op(hdl::Op::Kind::Concat, {byte, result});
+          }
+        }
+        return result;
+      } else {
+        throw_error(Error, "Chunk must have constant size");
+      }
+    }
+    
     bool merge_inplace(const Memory& other, hdl::Value* cond) {
       for (const auto& [base_address, chunk] : other._chunks) {
         if (_chunks.find(base_address) == _chunks.end()) {
@@ -293,28 +359,90 @@ namespace pathbeaver {
     }
   };
   
+  class Globals {
+  private:
+    hdl::Module& _module;
+    llvm::Module* _llvm_module = nullptr;
+    Memory _initial_memory;
+    std::map<llvm::GlobalVariable*, hdl::Unknown*> _variables;
+  public:
+    Globals(hdl::Module& module, llvm::Module* llvm_module):
+        _module(module),
+        _llvm_module(llvm_module),
+        _initial_memory(&module) {
+      
+      const llvm::DataLayout& data_layout = _llvm_module->getDataLayout();
+      size_t pointer_width = data_layout.getPointerSizeInBits();
+      
+      for (llvm::GlobalVariable& global_variable : _llvm_module->globals()) {
+        llvm::Constant* initializer = global_variable.getInitializer();
+        size_t size = data_layout.getTypeAllocSize(initializer->getType());
+        
+        hdl::Value* size_value = _module.constant(hdl::BitString::from_uint(size).truncate(pointer_width));
+        hdl::Unknown* base_address = _initial_memory.alloc(size_value);
+        
+        _variables[&global_variable] = base_address;
+      }
+      
+      for (llvm::GlobalVariable& global_variable : _llvm_module->globals()) {
+        hdl::Unknown* base_address = _variables.at(&global_variable);
+        llvm::Constant* initializer = global_variable.getInitializer();
+        
+        Value initial_value = (*this)[initializer];
+        std::map<size_t, hdl::Value*> layout = initial_value.to_bytes(
+          initializer->getType(), data_layout, _module
+        );
+        
+        for (const auto& [offset, byte] : layout) {
+          hdl::Value* offset_value = _module.constant(
+            hdl::BitString::from_uint(offset).truncate(pointer_width)
+          );
+          _initial_memory.store(
+            _module.op(hdl::Op::Kind::Add, {base_address, offset_value}),
+            byte
+          );
+        }
+      }
+    }
+    
+    const Memory& initial_memory() const { return _initial_memory; }
+    
+    Value operator[](llvm::Constant* constant) {
+      if (llvm_match(ConstantInt, constant_int, constant)) {
+        return _module.constant(ap_int_to_bit_string(constant_int->getValue()));
+      } else if (llvm_match(ConstantDataArray, constant_data_array, constant)) {
+        Value::Array array;
+        array.reserve(constant_data_array->getNumElements());
+        for (size_t it = 0; it < constant_data_array->getNumElements(); it++) {
+          array.push_back((*this)[constant_data_array->getElementAsConstant(it)]);
+        }
+        return array;
+      } else if (llvm_match(GlobalVariable, global_variable, constant)) {
+        return _variables.at(global_variable);
+      } else {
+        constant->print(llvm::outs());
+        llvm::outs() << '\n';
+        throw_error(Error, "Unknown constant");
+      }
+    }
+  };
+  
   class Trace {
   public:
     struct StackFrame {
       hdl::Module& module;
+      Globals& globals;
       llvm::Instruction* pc = nullptr;
       std::vector<llvm::BasicBlock*> joins;
       std::unordered_map<llvm::Value*, Value> values;
       std::vector<hdl::Unknown*> allocations;
       
-      StackFrame(hdl::Module& _module): module(_module) {}
+      StackFrame(hdl::Module& _module, Globals& _globals):
+        module(_module), globals(_globals) {}
       
       Value operator[](llvm::Value* value) const {
         if (llvm_match(Constant, constant, value)) {
-          if (llvm_match(ConstantInt, constant_int, value)) {
-            hdl::BitString bit_string(constant_int->getBitWidth());
-            for (size_t it = 0; it < bit_string.width(); it++) {
-              bit_string.set(it, constant_int->getValue()[it]);
-            }
-            return module.constant(bit_string);
-          } else {
-            throw_error(Error, "Unknown constant");
-          }
+          return globals[constant];
         } else {
           return values.at(value);
         }
@@ -389,19 +517,16 @@ namespace pathbeaver {
     
   private:
     hdl::Module& _module;
+    Globals& _globals;
     Requirements _requirements;
     std::vector<StackFrame> _stack;
     Memory _memory;
   public:
-    Trace(hdl::Module& module): _module(module), _requirements(&module), _memory(&module) {}
-    
-    static Trace call(hdl::Module& module,
-                      llvm::Function* function,
-                      const std::vector<Value>& args) {
-      Trace trace(module);
-      trace.call(function, args);
-      return trace;
-    }
+    Trace(hdl::Module& module, Globals& globals):
+      _module(module),
+      _globals(globals),
+      _requirements(&module),
+      _memory(globals.initial_memory()) {}
     
     static std::optional<Trace> merge(const std::vector<Trace>& traces) {
       if (traces.size() == 0) {
@@ -422,6 +547,7 @@ namespace pathbeaver {
     hdl::Module& module() const { return _module; }
     const Requirements& requirements() const { return _requirements; }
     const std::vector<StackFrame>& stack() const { return _stack; }
+    Memory& memory() { return _memory; }
     const Memory& memory() const { return _memory; }
     
     llvm::Instruction* current_inst() const { return _stack.back().pc; }
@@ -441,7 +567,7 @@ namespace pathbeaver {
         );
       }
       
-      StackFrame frame(_module);
+      StackFrame frame(_module, _globals);
       frame.pc = function->getEntryBlock().getFirstNonPHIOrDbg();
       for (size_t it = 0; it < args.size(); it++) {
         frame.values.insert({function->getArg(it), args[it]});
@@ -565,8 +691,43 @@ namespace pathbeaver {
           }),
           value.primitive()
         })));
+      } else if (llvm_match(TruncInst, trunc, cast)) {
+        frame.set(cast, Value(slice(value.primitive(), 0, dest_width)));
       } else {
         throw_error(Error, "Cast instruction " << cast->getOpcodeName() << " is not implemented");
+      }
+    }
+    
+    void trace_intrinsic(llvm::IntrinsicInst* intrinsic) {
+      StackFrame& frame = _stack.back();
+      
+      if (llvm_match(LifetimeIntrinsic, lifetime, intrinsic)) {
+        // Ignore
+      } else if (llvm_match(MinMaxIntrinsic, min_max, intrinsic)) {
+        hdl::Value* lhs = frame[min_max->getLHS()].primitive();
+        hdl::Value* rhs = frame[min_max->getRHS()].primitive();
+        hdl::Value* cond = trace_cmp(min_max->getPredicate(), lhs, rhs);
+        frame.set(intrinsic, _module.op(hdl::Op::Kind::Select, {
+          cond, lhs, rhs
+        }));
+      } else if (llvm_match(MemCpyInst, memcpy, intrinsic)) {
+        hdl::Constant* length_constant = dynamic_cast<hdl::Constant*>(frame[memcpy->getLength()].primitive());
+        if (!length_constant) {
+          throw_error(Error, "");
+        }
+        size_t length = length_constant->value.as_uint64();
+        hdl::Value* source = frame[memcpy->getSource()].primitive();
+        hdl::Value* dest = frame[memcpy->getDest()].primitive();
+        for (size_t offset = 0; offset < length; offset++) {
+          hdl::Value* offset_value = _module.constant(hdl::BitString::from_uint(offset));
+          offset_value = resize_u(offset_value, source->width);
+          _memory.store(
+            _module.op(hdl::Op::Kind::Add, {dest, offset_value}),
+            _memory.load(_module.op(hdl::Op::Kind::Add, {source, offset_value}))
+          );
+        }
+      } else {
+        throw_error(Error, "Intrinsic " << intrinsic->getCalledFunction()->getName().str() << " is not implemented");
       }
     }
     
@@ -590,7 +751,7 @@ namespace pathbeaver {
           }
           
           if (_stack.size() == 1) {
-            StackFrame frame(_module);
+            StackFrame frame(_module, _globals);
             frame.pc = nullptr;
             if (ret->getReturnValue() != nullptr) {
               frame.set(nullptr, callee_frame[ret->getReturnValue()]);
@@ -610,6 +771,23 @@ namespace pathbeaver {
             return StopReason::Branch;
           }
           enter(branch->getSuccessor(0), branch->getParent());
+        } else if (llvm_match(CallInst, call_inst, inst)) {
+          StackFrame& frame = _stack.back();
+          if (llvm_match(IntrinsicInst, intrinsic, inst)) {
+            trace_intrinsic(intrinsic);
+            frame.next();
+          } else {
+            llvm::Function* callee = call_inst->getCalledFunction();
+            if (callee == nullptr) {
+              throw_error(Error, "Not implemented");
+            }
+            std::vector<Value> args;
+            args.reserve(call_inst->arg_size());
+            for (llvm::Value* arg : call_inst->args()) {
+              args.push_back(frame[arg]);
+            }
+            call(callee, args);
+          }
         } else if (llvm_match(SelectInst, select, inst)) {
           StackFrame& frame = _stack.back();
           Value cond = frame[select->getCondition()];
@@ -618,6 +796,37 @@ namespace pathbeaver {
           frame.set(inst, _module.op(hdl::Op::Kind::Select, {
             cond.primitive(), a.primitive(), b.primitive()
           }));
+          frame.next();
+        } else if (llvm_match(GetElementPtrInst, gep, inst)) {
+          StackFrame& frame = _stack.back();
+          hdl::Value* pointer = frame[gep->getPointerOperand()].primitive();
+          
+          const llvm::DataLayout& data_layout = gep->getModule()->getDataLayout();
+          size_t pointer_width = data_layout.getPointerSizeInBits();
+          
+          llvm::MapVector<llvm::Value*, llvm::APInt> variable_offsets;
+          llvm::APInt constant_offset = llvm::APInt().zext(pointer_width);
+          bool success = gep->collectOffset(data_layout, pointer_width, variable_offsets, constant_offset);
+          if (!success) {
+            throw_error(Error, "Not supported");
+          }
+          
+          pointer = _module.op(hdl::Op::Kind::Add, {
+            pointer,
+            _module.constant(ap_int_to_bit_string(constant_offset))
+          });
+          
+          for (const auto& [value, factor] : variable_offsets) {
+            pointer = _module.op(hdl::Op::Kind::Add, {
+              pointer,
+              mul(
+                _module.constant(ap_int_to_bit_string(factor)),
+                frame[value].primitive()
+              )
+            });
+          }
+          
+          frame.set(inst, pointer);
           frame.next();
         } else if (llvm_match(AllocaInst, alloca, inst)) {
           StackFrame& frame = _stack.back();

@@ -33,8 +33,11 @@
 
 #include <llvm/Analysis/PostDominators.h>
 
+#include <z3++.h>
+
 #include "../modules/hdl.cpp/hdl.hpp"
 #include "../modules/hdl.cpp/hdl_analysis.hpp"
+#include "../modules/hdl.cpp/hdl_proof_z3.hpp"
 
 #define throw_error(Error, msg) {\
   std::ostringstream message_stream; \
@@ -116,6 +119,16 @@ namespace pathbeaver {
           }
         }
       }
+      if (llvm_match(IntegerType, integer_type, type)) {
+        size_t bit_width = integer_type->getBitWidth();
+        if (bit_width != value->width) {
+          value = module.op(hdl::Op::Kind::Slice, {
+            value,
+            module.constant(hdl::BitString::from_uint(0)),
+            module.constant(hdl::BitString::from_uint(bit_width))
+          });
+        }
+      }
       return Value(value);
     }
     
@@ -139,9 +152,16 @@ namespace pathbeaver {
       switch (kind()) {
         case Kind::Primitive: {
           size_t size = data_layout.getTypeStoreSize(type);
+          hdl::Value* value = primitive();
+          if (value->width % 8 != 0) {
+            value = module.op(hdl::Op::Kind::Concat, {
+              module.constant(hdl::BitString(8 - (value->width % 8))),
+              value
+            });
+          }
           for (size_t it = 0; it < size; it++) {
             hdl::Value* byte = module.op(hdl::Op::Kind::Slice, {
-              primitive(),
+              value,
               module.constant(hdl::BitString::from_uint(it * 8)),
               module.constant(hdl::BitString::from_uint(8))
             });
@@ -174,6 +194,148 @@ namespace pathbeaver {
     }
   };
   
+  class Exceptions {
+  public:
+    enum class Kind {
+      None,
+      OutOfBounds,
+      UseAfterFree,
+      DoubleFree,
+      NullAccess
+    };
+    
+    static constexpr const char* KIND_NAMES[] = {
+      "None",
+      "OutOfBounds",
+      "UseAfterFree",
+      "DoubleFree",
+      "NullAccess"
+    };
+    
+    struct Exception {
+      Kind kind = Kind::None;
+      hdl::Value* condition = nullptr;
+      llvm::Instruction* source = nullptr;
+      
+      Exception() {}
+      Exception(Kind _kind, hdl::Value* _condition, llvm::Instruction* _source):
+        kind(_kind), condition(_condition), source(_source) {}
+      
+      Exception with_requirement(hdl::Value* cond, hdl::Module& module) const {
+        Exception exception = *this;
+        exception.condition = module.op(hdl::Op::Kind::And, {exception.condition, cond});
+        return exception;
+      }
+    };
+    
+    struct Model {
+      std::map<hdl::Value*, hdl::BitString> inputs;
+      std::vector<Exception> triggered;
+      
+      bool triggers(Kind kind) const {
+        for (const Exception& exception : triggered) {
+          if (exception.kind == kind) {
+            return true;
+          }
+        }
+        return false;
+      }
+    };
+  private:
+    hdl::Module& _module;
+    llvm::Instruction* _current_source = nullptr;
+    std::vector<Exception> _exceptions;
+  public:
+    Exceptions(hdl::Module& module): _module(module) {}
+    
+    inline size_t size() const { return _exceptions.size(); }
+    inline llvm::Instruction* current_source() const { return _current_source; }
+    
+    void set_current_source(llvm::Instruction* source) { 
+      _current_source = source;
+    }
+    
+    void add(const Exception& exception) {
+      if (hdl::Constant* constant = dynamic_cast<hdl::Constant*>(exception.condition)) {
+        if (constant->value.is_zero()) {
+          return;
+        }
+      }
+      _exceptions.push_back(exception);
+    }
+    
+    void add(Kind kind, hdl::Value* condition) {
+      add(Exception(kind, condition, _current_source));
+    }
+    
+    void add(Kind kind) {
+      add(kind, _module.constant(hdl::BitString::from_bool(true)));
+    }
+    
+    void merge_inplace(const Exceptions& other, hdl::Value* cond) {
+      for (Exception& exception : _exceptions) {
+        exception = exception.with_requirement(cond, _module);
+      }
+      
+      hdl::Value* not_cond = _module.op(hdl::Op::Kind::Not, {cond});
+      for (const Exception& exception : other._exceptions) {
+        _exceptions.push_back(exception.with_requirement(not_cond, _module));
+      }
+    }
+    
+    hdl::Value* any_occurred() const {
+      hdl::Value* result = _module.constant(hdl::BitString::from_bool(false));
+      for (const Exception& exception : _exceptions) {
+        result = _module.op(hdl::Op::Kind::Or, {
+          result,
+          exception.condition
+        });
+      }
+      return result;
+    }
+    
+    std::optional<Model> prove(const std::set<hdl::Value*> inputs) const {
+      z3::context context;
+      z3::solver solver(context);
+      hdl::proof::z3::Builder builder(context);
+      
+      for (hdl::Value* input : inputs) {
+        builder.free(input);
+      }
+      
+      builder.require(
+        solver,
+        any_occurred(),
+        hdl::BitString::from_bool(true)
+      );
+      
+      z3::check_result result = solver.check();
+      if (result == z3::sat) {
+        Model model;
+        for (hdl::Value* input : inputs) {
+          model.inputs[input] = builder.interp(solver, input);
+        }
+        
+        for (const Exception& exception : _exceptions) {
+          if (builder.interp(solver, exception.condition).is_all_ones()) {
+            model.triggered.push_back(exception);
+          }
+        }
+        
+        return model;
+      }
+      
+      return {};
+    }
+    
+    void ensure_none_occur(const std::set<hdl::Value*>& inputs) const {
+      std::optional<Model> model = prove(inputs);
+      if (model.has_value()) {
+        throw_error(Error, KIND_NAMES[size_t(model.value().triggered[0].kind)] << " exception occurred");
+      }
+    }
+  };
+  
   using AffineValue = hdl::analysis::AffineValue;
   
   class Memory {
@@ -198,16 +360,23 @@ namespace pathbeaver {
       Chunk(hdl::Module* _module, hdl::Unknown* _address, hdl::Value* _size):
         module(_module), address(_address), size(_size) {}
       
-      void store(hdl::Value* enable, const AffineValue& offset, hdl::Value* value) {
+      void store(hdl::Value* enable, const AffineValue& offset, hdl::Value* value, Exceptions* exceptions) {
+        if (exceptions != nullptr) {
+          exceptions->add(
+            Exceptions::Kind::OutOfBounds,
+            module->op(hdl::Op::Kind::And, {
+              enable,
+              module->op(hdl::Op::Kind::Not, {
+                module->op(hdl::Op::Kind::LtU, {offset.build(*module), size})
+              })
+            })
+          );
+        }
+        
         if (offset.is_constant()) {
           if (base.find(offset.constant.as_uint64()) == base.end()) {
             base[offset.constant.as_uint64()] = module->unknown(8);
           }
-          std::cout << "store: " << offset.constant.as_uint64();
-          if (hdl::Constant* constant = dynamic_cast<hdl::Constant*>(value)) {
-            std::cout << " value: " << constant->value;
-          }
-          std::cout << std::endl;
           base[offset.constant.as_uint64()] = module->op(hdl::Op::Kind::Select, {
             enable, value, base.at(offset.constant.as_uint64())
           });
@@ -217,11 +386,20 @@ namespace pathbeaver {
         }
       }
       
-      void store(const AffineValue& offset, hdl::Value* value) {
-        store(module->constant(hdl::BitString::from_bool(true)), offset, value);
+      void store(const AffineValue& offset, hdl::Value* value, Exceptions* exceptions) {
+        store(module->constant(hdl::BitString::from_bool(true)), offset, value, exceptions);
       }
       
-      hdl::Value* load(const AffineValue& offset) {
+      hdl::Value* load(const AffineValue& offset, Exceptions* exceptions) {
+        if (exceptions != nullptr) {
+          exceptions->add(
+            Exceptions::Kind::OutOfBounds,
+            module->op(hdl::Op::Kind::Not, {
+              module->op(hdl::Op::Kind::LtU, {offset.build(*module), size})
+            })
+          );
+        }
+        
         if (offset.is_constant()) {
           if (base.find(offset.constant.as_uint64()) == base.end()) {
             base[offset.constant.as_uint64()] = module->unknown(8);
@@ -249,9 +427,13 @@ namespace pathbeaver {
       }
       
       bool merge_inplace(const Chunk& other_chunk, hdl::Value* cond) {
+        if (size != other_chunk.size) {
+          return false;
+        }
+        
         hdl::Value* not_cond = module->op(hdl::Op::Kind::Not, {cond});
         for (const auto& [offset, value] : other_chunk.base) {
-          store(not_cond, AffineValue(hdl::BitString::from_uint(offset).truncate(address->width)), value);
+          store(not_cond, AffineValue(hdl::BitString::from_uint(offset).truncate(address->width)), value, nullptr);
         }
         
         /*for (const Write& write : other_chunk.writes) {
@@ -302,44 +484,72 @@ namespace pathbeaver {
       return {};
     }
     
-    hdl::Value* load(hdl::Value* address) {
+    hdl::Value* load(hdl::Value* address, Exceptions* exceptions) {
       std::optional<BaseOffset> split = split_address(address);
       if (!split.has_value()) {
+        if (exceptions != nullptr && dynamic_cast<hdl::Constant*>(address)) {
+          exceptions->add(Exceptions::Kind::NullAccess);
+          return _module->unknown(8);
+        }
         throw_error(Error, "TODO");
       }
-      return _chunks.at(split.value().base).value().load(split.value().offset);
+      std::optional<Chunk>& chunk = _chunks.at(split.value().base);
+      if (exceptions != nullptr && !chunk.has_value()) {
+        exceptions->add(Exceptions::Kind::UseAfterFree);
+        return _module->unknown(8);
+      }
+      return chunk.value().load(split.value().offset, exceptions);
     }
     
-    void store(hdl::Value* address, hdl::Value* value) {
+    void store(hdl::Value* address, hdl::Value* value, Exceptions* exceptions) {
       if (value->width != 8) {
         throw_error(Error, "");
       }
       std::optional<BaseOffset> split = split_address(address);
       if (!split.has_value()) {
+        if (exceptions != nullptr && dynamic_cast<hdl::Constant*>(address)) {
+          exceptions->add(Exceptions::Kind::NullAccess);
+          return;
+        }
         throw_error(Error, "TODO");
       }
-      _chunks.at(split.value().base).value().store(split.value().offset, value);
+      std::optional<Chunk>& chunk = _chunks.at(split.value().base);
+      if (exceptions != nullptr && !chunk.has_value()) {
+        exceptions->add(Exceptions::Kind::UseAfterFree);
+        return;
+      }
+      chunk.value().store(split.value().offset, value, exceptions);
     }
     
-    hdl::Value* load_all(hdl::Unknown* base_address) {
+    std::vector<hdl::Value*> load_bytes(hdl::Unknown* base_address) {
       Chunk& chunk = _chunks.at(base_address).value();
       if (hdl::Constant* constant_size = dynamic_cast<hdl::Constant*>(chunk.size)) {
         size_t size = constant_size->value.as_uint64();
-        hdl::Value* result = nullptr;
+        std::vector<hdl::Value*> bytes;
+        bytes.reserve(size);
         for (size_t it = 0; it < size; it++) {
           AffineValue offset(hdl::BitString::from_uint(it).truncate(base_address->width));
-          hdl::Value* byte = chunk.load(offset);
-          
-          if (result == nullptr) {
-            result = byte;
-          } else {
-            result = _module->op(hdl::Op::Kind::Concat, {byte, result});
-          }
+          hdl::Value* byte = chunk.load(offset, nullptr);
+          bytes.push_back(byte);
         }
-        return result;
+        return bytes;
       } else {
         throw_error(Error, "Chunk must have constant size");
       }
+    }
+    
+    hdl::Value* load_all(hdl::Unknown* base_address) {
+      std::vector<hdl::Value*> bytes = load_bytes(base_address);
+      
+      hdl::Value* result = nullptr;
+      for (hdl::Value* byte : bytes) {
+        if (result == nullptr) {
+          result = byte;
+        } else {
+          result = _module->op(hdl::Op::Kind::Concat, {result, byte});
+        }
+      }
+      return result;
     }
     
     bool merge_inplace(const Memory& other, hdl::Value* cond) {
@@ -365,6 +575,8 @@ namespace pathbeaver {
     llvm::Module* _llvm_module = nullptr;
     Memory _initial_memory;
     std::map<llvm::GlobalVariable*, hdl::Unknown*> _variables;
+    std::map<llvm::Function*, hdl::Unknown*> _functions;
+    std::map<hdl::Unknown*, llvm::Function*> _unknown_to_function;
   public:
     Globals(hdl::Module& module, llvm::Module* llvm_module):
         _module(module),
@@ -399,17 +611,27 @@ namespace pathbeaver {
           );
           _initial_memory.store(
             _module.op(hdl::Op::Kind::Add, {base_address, offset_value}),
-            byte
+            byte,
+            nullptr
           );
         }
       }
     }
     
+    Memory& initial_memory() { return _initial_memory; }
     const Memory& initial_memory() const { return _initial_memory; }
+    
+    llvm::Function* function(hdl::Unknown* unknown) {
+      return _unknown_to_function.at(unknown);
+    }
     
     Value operator[](llvm::Constant* constant) {
       if (llvm_match(ConstantInt, constant_int, constant)) {
         return _module.constant(ap_int_to_bit_string(constant_int->getValue()));
+      } else if (llvm_match(ConstantPointerNull, pointer_null, constant)) {
+        const llvm::DataLayout& data_layout = _llvm_module->getDataLayout();
+        size_t pointer_width = data_layout.getPointerSizeInBits();
+        return _module.constant(hdl::BitString(pointer_width));
       } else if (llvm_match(ConstantDataArray, constant_data_array, constant)) {
         Value::Array array;
         array.reserve(constant_data_array->getNumElements());
@@ -419,6 +641,15 @@ namespace pathbeaver {
         return array;
       } else if (llvm_match(GlobalVariable, global_variable, constant)) {
         return _variables.at(global_variable);
+      } else if (llvm_match(Function, function, constant)) {
+        if (_functions.find(function) == _functions.end()) {
+          const llvm::DataLayout& data_layout = _llvm_module->getDataLayout();
+          size_t pointer_width = data_layout.getPointerSizeInBits();
+          hdl::Unknown* unknown = _module.unknown(pointer_width);
+          _functions.insert({function, unknown});
+          _unknown_to_function.insert({unknown, function});
+        }
+        return _functions.at(function);
       } else {
         constant->print(llvm::outs());
         llvm::outs() << '\n';
@@ -519,6 +750,7 @@ namespace pathbeaver {
     hdl::Module& _module;
     Globals& _globals;
     Requirements _requirements;
+    Exceptions _exceptions;
     std::vector<StackFrame> _stack;
     Memory _memory;
   public:
@@ -526,6 +758,7 @@ namespace pathbeaver {
       _module(module),
       _globals(globals),
       _requirements(&module),
+      _exceptions(module),
       _memory(globals.initial_memory()) {}
     
     static std::optional<Trace> merge(const std::vector<Trace>& traces) {
@@ -546,6 +779,7 @@ namespace pathbeaver {
     
     hdl::Module& module() const { return _module; }
     const Requirements& requirements() const { return _requirements; }
+    const Exceptions& exceptions() const { return _exceptions; }
     const std::vector<StackFrame>& stack() const { return _stack; }
     Memory& memory() { return _memory; }
     const Memory& memory() const { return _memory; }
@@ -693,6 +927,8 @@ namespace pathbeaver {
         })));
       } else if (llvm_match(TruncInst, trunc, cast)) {
         frame.set(cast, Value(slice(value.primitive(), 0, dest_width)));
+      } else if (cast->isNoopCast(cast->getModule()->getDataLayout())) {
+        frame.set(cast, value);
       } else {
         throw_error(Error, "Cast instruction " << cast->getOpcodeName() << " is not implemented");
       }
@@ -723,9 +959,35 @@ namespace pathbeaver {
           offset_value = resize_u(offset_value, source->width);
           _memory.store(
             _module.op(hdl::Op::Kind::Add, {dest, offset_value}),
-            _memory.load(_module.op(hdl::Op::Kind::Add, {source, offset_value}))
+            _memory.load(_module.op(hdl::Op::Kind::Add, {source, offset_value}), &_exceptions),
+            &_exceptions
           );
         }
+      } else if (llvm_match(MemSetInst, memset, intrinsic)) {
+        hdl::Constant* length_constant = dynamic_cast<hdl::Constant*>(frame[memset->getLength()].primitive());
+        if (!length_constant) {
+          throw_error(Error, "");
+        }
+        size_t length = length_constant->value.as_uint64();
+        hdl::Value* value = frame[memset->getValue()].primitive();
+        hdl::Value* dest = frame[memset->getDest()].primitive();
+        if (value->width != 8) {
+          throw_error(Error, "");
+        }
+        for (size_t offset = 0; offset < length; offset++) {
+          hdl::Value* offset_value = _module.constant(hdl::BitString::from_uint(offset));
+          offset_value = resize_u(offset_value, dest->width);
+          _memory.store(_module.op(hdl::Op::Kind::Add, {dest, offset_value}), value, &_exceptions);
+        }
+      } else if (intrinsic->getIntrinsicID() == llvm::Intrinsic::fshl) {
+        hdl::Value* a = frame[intrinsic->getArgOperand(0)].primitive();
+        hdl::Value* b = frame[intrinsic->getArgOperand(1)].primitive();
+        hdl::Value* c = frame[intrinsic->getArgOperand(2)].primitive();
+        
+        frame.set(intrinsic, slice(_module.op(hdl::Op::Kind::Shl, { 
+          _module.op(hdl::Op::Kind::Concat, {a, b}),
+          c
+        }), b->width, a->width));
       } else {
         throw_error(Error, "Intrinsic " << intrinsic->getCalledFunction()->getName().str() << " is not implemented");
       }
@@ -741,8 +1003,13 @@ namespace pathbeaver {
         if (_stack.back().is_join(inst->getParent())) {
           return StopReason::Join;
         }
+        
+        #ifdef PATHBEAVER_DEBUG
         inst->print(llvm::outs());
         llvm::outs() << '\n';
+        #endif
+        
+        _exceptions.set_current_source(inst);
         
         if (llvm_match(ReturnInst, ret, inst)) {
           StackFrame& callee_frame = _stack.back();
@@ -779,7 +1046,12 @@ namespace pathbeaver {
           } else {
             llvm::Function* callee = call_inst->getCalledFunction();
             if (callee == nullptr) {
-              throw_error(Error, "Not implemented");
+              hdl::Value* callee_value = frame[call_inst->getCalledOperand()].primitive();
+              hdl::Unknown* unknown = dynamic_cast<hdl::Unknown*>(callee_value);
+              if (unknown == nullptr) {
+                throw_error(Error, "");
+              }
+              callee = _globals.function(unknown);
             }
             std::vector<Value> args;
             args.reserve(call_inst->arg_size());
@@ -858,7 +1130,7 @@ namespace pathbeaver {
               pointer,
               resize_u(offset_value, pointer->width)
             });
-            _memory.store(address, byte);
+            _memory.store(address, byte, &_exceptions);
           }
           _stack.back().next();
         } else if (llvm_match(LoadInst, load, inst)) {
@@ -876,7 +1148,7 @@ namespace pathbeaver {
               pointer,
               resize_u(offset_value, pointer->width)
             });
-            bytes.push_back(_memory.load(address));
+            bytes.push_back(_memory.load(address, &_exceptions));
           }
           
           frame.set(load, Value::from_bytes(type, data_layout, bytes, _module));
@@ -929,12 +1201,8 @@ namespace pathbeaver {
       llvm::PostDominatorTree postdom(*function);
       
       llvm::BasicBlock* join = traces[0].current_inst()->getParent();
-      join->printAsOperand(llvm::outs());
-      llvm::outs() << '\n';
       for (size_t it = 1; it < traces.size(); it++) {
         llvm::BasicBlock* block = traces[it].current_inst()->getParent();
-        block->printAsOperand(llvm::outs());
-        llvm::outs() << '\n';
         join = postdom.findNearestCommonDominator(join, block);
       }
       
@@ -965,16 +1233,21 @@ namespace pathbeaver {
     }
     
     Trace trace_recursive() {
+      #ifdef PATHBEAVER_DEBUG
       std::cout << "Trace" << std::endl;
+      #endif
+      
       Trace trace = *this;
       StopReason reason = trace.trace_until_branch();
       while (reason == StopReason::Branch) {
         std::vector<Trace> options = trace.split_at_branch();
         llvm::BasicBlock* join = find_join_block(options);
         
+        #ifdef PATHBEAVER_DEBUG
         llvm::outs() << "Branch. Rejoin at: ";
         join->printAsOperand(llvm::outs());
         llvm::outs() << '\n';
+        #endif
         
         std::vector<Trace> joined;
         for (Trace& option : options) {
@@ -991,7 +1264,9 @@ namespace pathbeaver {
           joined.push_back(done);
         }
         
+        #ifdef PATHBEAVER_DEBUG
         std::cout << "Rejoined" << std::endl;
+        #endif
         
         std::optional<Trace> merged = Trace::merge(joined);
         move_into(trace, std::move(merged.value()));
@@ -1047,12 +1322,11 @@ namespace pathbeaver {
         return false;
       }
       
+      _exceptions.merge_inplace(other._exceptions, cond);
       _requirements = _requirements.merge(other._requirements);
       
       return true;
     }
-    
-    
   };
 }
 

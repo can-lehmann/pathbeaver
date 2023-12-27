@@ -4,3 +4,6 @@ examples/*/*.bc
 examples/*/*.ll
 examples/*/*.svg
 examples/*/*.gv
+tests/input/*.bc
+tests/test_equivalence
+tests/test_exceptions

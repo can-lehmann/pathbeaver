@@ -5,5 +5,6 @@ examples/*/*.ll
 examples/*/*.svg
 examples/*/*.gv
 tests/input/*.bc
+tests/input/*.ll
 tests/test_equivalence
 tests/test_exceptions

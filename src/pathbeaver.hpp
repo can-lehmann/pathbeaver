@@ -340,13 +340,124 @@ namespace pathbeaver {
   
   class Memory {
   public:
-    struct Write {
-      hdl::Value* enable = nullptr;
-      AffineValue offset = nullptr;
-      hdl::Value* value = nullptr;
+    struct Initializer {
+    public:
+      virtual ~Initializer() = default;
+      virtual hdl::Value* operator[](const AffineValue& offset) = 0;
+    };
+    
+    struct Layer {
+      struct Entry {
+        hdl::Value* enable = nullptr;
+        hdl::Value* value = nullptr;
+        
+        Entry(hdl::Value* _enable, hdl::Value* _value):
+          enable(_enable), value(_value) {}
+      };
       
-      Write(hdl::Value* _enable, AffineValue _offset, hdl::Value* _value):
-        enable(_enable), offset(_offset), value(_value) {}
+      hdl::Module* module = nullptr;
+      AffineValue base_offset;
+      std::map<uint64_t, Entry> entries;
+      
+      Layer(hdl::Module* _module, const AffineValue& _base_offset):
+        module(_module), base_offset(_base_offset) {}
+      
+      void store(hdl::Value* enable, const AffineValue& offset, hdl::Value* value) {
+        uint64_t constant_offset = offset.constant.as_uint64();
+        if (entries.find(constant_offset) == entries.end()) {
+          entries.insert({constant_offset, Entry(enable, value)});
+        } else {
+          Entry& entry = entries.at(constant_offset);
+          entry.enable = module->op(hdl::Op::Kind::Or, {
+            enable, entry.enable
+          });
+          entry.value = module->op(hdl::Op::Kind::Select, {
+            enable, value, entry.value
+          });
+        }
+      }
+      
+      hdl::Value* load(hdl::Value* initial, const AffineValue& query_offset) const {
+        AffineValue query_base_offset = query_offset;
+        query_base_offset.constant = hdl::BitString(query_offset.width());
+        uint64_t query_constant_offset = query_offset.constant.as_uint64();
+        
+        hdl::Value* result = initial;
+        if (base_offset == query_base_offset) {
+          if (entries.find(query_constant_offset) != entries.end()) {
+            const Entry& entry = entries.at(query_constant_offset);
+            result = module->op(hdl::Op::Kind::Select, {
+              entry.enable, entry.value, result
+            });
+          }
+        } else {
+          for (const auto& [constant_offset, entry] : entries) {
+            AffineValue entry_offset = base_offset;
+            entry_offset = entry_offset + hdl::BitString::from_uint(constant_offset).truncate(entry_offset.width());
+            result = module->op(hdl::Op::Kind::Select, {
+              module->op(hdl::Op::Kind::And, {
+                module->op(hdl::Op::Kind::Eq, {
+                  (entry_offset - query_offset).build(*module),
+                  module->constant(hdl::BitString(entry_offset.width()))
+                }),
+                entry.enable
+              }),
+              entry.value,
+              result
+            });
+          }
+        }
+        
+        return result;
+      }
+    };
+    
+    class UnknownInitializer: public Initializer {
+    private:
+      hdl::Module* _module = nullptr;
+      std::vector<Layer> _layers;
+    public:
+      UnknownInitializer(hdl::Module* module): _module(module) {}
+      
+      static std::shared_ptr<UnknownInitializer> create(hdl::Module* module) {
+        return std::make_shared<UnknownInitializer>(module);
+      }
+      
+      hdl::Value* operator[](const AffineValue& offset) {
+        AffineValue base_offset = offset;
+        base_offset.constant = hdl::BitString(offset.width());
+        uint64_t constant_offset = offset.constant.as_uint64();
+        
+        hdl::Value* result = _module->unknown(8);
+        bool create_layer = true;
+        for (size_t it = _layers.size(); it-- > 0; ) {
+          Layer& layer = _layers[it];
+          
+          if (layer.base_offset == base_offset) {
+            if (layer.entries.find(constant_offset) == layer.entries.end()) {
+              layer.entries.insert({
+                constant_offset,
+                Layer::Entry(_module->constant(hdl::BitString::from_bool(true)), result)
+              });
+            } else {
+              result = layer.entries.at(constant_offset).value;
+            }
+            create_layer = false;
+          } else {
+            result = layer.load(result, offset);
+          }
+        }
+        
+        if (create_layer) {
+          _layers.emplace_back(_module, base_offset);
+          _layers.back().entries.insert({
+            constant_offset,
+            Layer::Entry(_module->constant(hdl::BitString::from_bool(true)), result)
+          });
+        }
+        
+        return result;
+      }
     };
     
     struct Chunk {
@@ -354,11 +465,14 @@ namespace pathbeaver {
       hdl::Unknown* address = nullptr;
       hdl::Value* size = nullptr;
       
-      std::map<uint64_t, hdl::Value*> base;
-      std::vector<Write> writes;
+      std::shared_ptr<Initializer> initializer;
+      std::vector<Layer> layers;
       
       Chunk(hdl::Module* _module, hdl::Unknown* _address, hdl::Value* _size):
-        module(_module), address(_address), size(_size) {}
+        module(_module),
+        address(_address),
+        size(_size),
+        initializer(UnknownInitializer::create(_module)) {}
       
       void store(hdl::Value* enable, const AffineValue& offset, hdl::Value* value, Exceptions* exceptions) {
         if (exceptions != nullptr) {
@@ -373,17 +487,14 @@ namespace pathbeaver {
           );
         }
         
-        if (offset.is_constant()) {
-          if (base.find(offset.constant.as_uint64()) == base.end()) {
-            base[offset.constant.as_uint64()] = module->unknown(8);
-          }
-          base[offset.constant.as_uint64()] = module->op(hdl::Op::Kind::Select, {
-            enable, value, base.at(offset.constant.as_uint64())
-          });
-        } else {
-          throw_error(Error, "");
-          writes.emplace_back(enable, offset, value);
+        AffineValue base_offset = offset;
+        base_offset.constant = hdl::BitString(offset.width());
+        if (layers.size() == 0 || layers.back().base_offset != base_offset) {
+          layers.emplace_back(module, base_offset);
         }
+        
+        Layer& layer = layers.back();
+        layer.store(enable, offset, value);
       }
       
       void store(const AffineValue& offset, hdl::Value* value, Exceptions* exceptions) {
@@ -400,30 +511,11 @@ namespace pathbeaver {
           );
         }
         
-        if (offset.is_constant()) {
-          if (base.find(offset.constant.as_uint64()) == base.end()) {
-            base[offset.constant.as_uint64()] = module->unknown(8);
-          }
-          return base.at(offset.constant.as_uint64());
-        } else {
-          throw_error(Error, "");
-          
-          hdl::Value* result = module->unknown(8);
-          for (const Write& write : writes) {
-            result = module->op(hdl::Op::Kind::Select, {
-              module->op(hdl::Op::Kind::And, {
-                write.enable,
-                module->op(hdl::Op::Kind::Eq, {
-                  (offset - write.offset).build(*module),
-                  module->constant(hdl::BitString(offset.width()))
-                })
-              }),
-              write.value,
-              result
-            });
-          }
-          return result;
+        hdl::Value* result = (*initializer)[offset];
+        for (const Layer& layer : layers) {
+          result = layer.load(result, offset);
         }
+        return result;
       }
       
       bool merge_inplace(const Chunk& other_chunk, hdl::Value* cond) {
@@ -432,14 +524,16 @@ namespace pathbeaver {
         }
         
         hdl::Value* not_cond = module->op(hdl::Op::Kind::Not, {cond});
-        for (const auto& [offset, value] : other_chunk.base) {
-          store(not_cond, AffineValue(hdl::BitString::from_uint(offset).truncate(address->width)), value, nullptr);
+        for (const Layer& layer : other_chunk.layers) {
+          for (const auto& [constant_offset, entry] : layer.entries) {
+            AffineValue offset = layer.base_offset;
+            offset = offset + hdl::BitString::from_uint(constant_offset).truncate(address->width);
+            hdl::Value* enable = module->op(hdl::Op::Kind::And, {
+              not_cond, entry.enable
+            });
+            store(enable, offset, entry.value, nullptr);
+          }
         }
-        
-        /*for (const Write& write : other_chunk.writes) {
-          hdl::Value* enable = module->op(hdl::Op::Kind::And, {write.enable, not_cond});
-          store(enable, write.offset, write.value);
-        }*/
         
         return true;
       }

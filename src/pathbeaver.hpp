@@ -988,6 +988,15 @@ namespace pathbeaver {
           _module.op(hdl::Op::Kind::Concat, {a, b}),
           c
         }), b->width, a->width));
+      } else if (intrinsic->getIntrinsicID() == llvm::Intrinsic::abs) {
+        hdl::Value* a = frame[intrinsic->getArgOperand(0)].primitive();
+        
+        hdl::Value* zero = _module.constant(hdl::BitString(a->width));
+        frame.set(intrinsic, _module.op(hdl::Op::Kind::Select, {
+          _module.op(hdl::Op::Kind::LtS, {a, zero}),
+          _module.op(hdl::Op::Kind::Sub, {zero, a}),
+          a
+        }));
       } else {
         throw_error(Error, "Intrinsic " << intrinsic->getCalledFunction()->getName().str() << " is not implemented");
       }
@@ -1038,6 +1047,8 @@ namespace pathbeaver {
             return StopReason::Branch;
           }
           enter(branch->getSuccessor(0), branch->getParent());
+        } else if (llvm_match(SwitchInst, branch, inst)) {
+          return StopReason::Branch;
         } else if (llvm_match(CallInst, call_inst, inst)) {
           StackFrame& frame = _stack.back();
           if (llvm_match(IntrinsicInst, intrinsic, inst)) {
@@ -1184,6 +1195,32 @@ namespace pathbeaver {
         if (else_trace._requirements.require_not(frame[branch->getCondition()].primitive())) {
           else_trace.enter(branch->getSuccessor(1), branch->getParent());
           traces.push_back(else_trace);
+        }
+      } else if (llvm_match(SwitchInst, switch_inst, inst)) {
+        hdl::Value* discr = frame[switch_inst->getCondition()].primitive();
+        hdl::Value* any_matches = _module.constant(hdl::BitString::from_bool(false));
+        for (const llvm::SwitchInst::CaseHandle& handle : switch_inst->cases()) {
+          hdl::Value* cond = _module.op(hdl::Op::Kind::Eq, {
+            discr, _globals[handle.getCaseValue()].primitive()
+          });
+          
+          Trace trace = *this;
+          if (trace._requirements.require(cond)) {
+            trace.enter(handle.getCaseSuccessor(), switch_inst->getParent());
+            traces.push_back(trace);
+          }
+          
+          any_matches = _module.op(hdl::Op::Kind::Or, {
+            any_matches, cond
+          });
+        }
+        
+        if (switch_inst->getDefaultDest() != nullptr) {
+          Trace default_trace = *this;
+          if (default_trace._requirements.require_not(any_matches)) {
+            default_trace.enter(switch_inst->getDefaultDest(), switch_inst->getParent());
+            traces.push_back(default_trace);
+          }
         }
       } else {
         throw_error(Error, "Instruction " << inst->getOpcodeName() << " is not a supported branch instruction.");

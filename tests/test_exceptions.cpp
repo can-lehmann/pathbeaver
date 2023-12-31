@@ -49,7 +49,7 @@ int main(int argc, const char** argv) {
       unittest_assert(model.value().triggers(pathbeaver::Exceptions::Kind::OutOfBounds));
     }
     
-    if (false) { // TODO
+    {
       hdl::Value* x = module.input("x", 32);
       llvm::Function* function = llvm_module->getFunction("out_of_bounds_2");
       pathbeaver::Trace initial_trace(module, globals);
@@ -58,6 +58,7 @@ int main(int argc, const char** argv) {
       std::optional<pathbeaver::Exceptions::Model> model = merged.exceptions().prove({x});
       unittest_assert(model.has_value());
       unittest_assert(model.value().triggers(pathbeaver::Exceptions::Kind::OutOfBounds));
+      unittest_assert(model.value().inputs.at(x).as_uint64() > 1);
     }
     
     {
@@ -83,6 +84,30 @@ int main(int argc, const char** argv) {
     }
     
     {
+      hdl::Value* x = module.input("x", 32);
+      llvm::Function* function = llvm_module->getFunction("out_of_bounds_5");
+      pathbeaver::Trace initial_trace(module, globals);
+      initial_trace.call(function, {x});
+      pathbeaver::Trace merged = initial_trace.trace_recursive();
+      std::optional<pathbeaver::Exceptions::Model> model = merged.exceptions().prove({x});
+      unittest_assert(model.has_value());
+      unittest_assert(model.value().triggers(pathbeaver::Exceptions::Kind::OutOfBounds));
+      unittest_assert(model.value().inputs.at(x).as_uint64() & (1 << 31));
+    }
+    
+    {
+      hdl::Value* x = module.input("x", 32);
+      llvm::Function* function = llvm_module->getFunction("out_of_bounds_6");
+      pathbeaver::Trace initial_trace(module, globals);
+      initial_trace.call(function, {x});
+      pathbeaver::Trace merged = initial_trace.trace_recursive();
+      std::optional<pathbeaver::Exceptions::Model> model = merged.exceptions().prove({x});
+      unittest_assert(model.has_value());
+      unittest_assert(model.value().triggers(pathbeaver::Exceptions::Kind::OutOfBounds));
+      unittest_assert(model.value().inputs.at(x).as_uint64() == 3);
+    }
+    
+    {
       llvm::Function* function = llvm_module->getFunction("no_out_of_bounds_1");
       pathbeaver::Trace initial_trace(module, globals);
       initial_trace.call(function, {});
@@ -91,7 +116,7 @@ int main(int argc, const char** argv) {
       unittest_assert(!model.has_value());
     }
     
-    if (false) {
+    {
       hdl::Value* x = module.input("x", 32);
       llvm::Function* function = llvm_module->getFunction("no_out_of_bounds_2");
       pathbeaver::Trace initial_trace(module, globals);

@@ -45,6 +45,17 @@ int32_t out_of_bounds_4(int32_t x) {
   return x == 10 ? values[3] : values[1];
 }
 
+int out_of_bounds_5(int32_t index) {
+  int values[2] = {0, 1};
+  return index < 2 ? values[index] : 0;
+}
+
+int out_of_bounds_6(uint32_t index) {
+  int values[3] = {0, 1, 2};
+  int indices[5] = {1, 2, 0, 3, 2};
+  return values[index < 5 ? indices[index] : 0];
+}
+
 int no_out_of_bounds_1() {
   int values[2] = {0, 1};
   return values[1];
@@ -52,7 +63,7 @@ int no_out_of_bounds_1() {
 
 int no_out_of_bounds_2(int32_t index) {
   int values[2] = {0, 1};
-  return index < 2 ? values[index] : 0;
+  return index >= 0 && index < 2 ? values[index] : 0;
 }
 
 int32_t no_out_of_bounds_3() {

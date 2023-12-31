@@ -59,6 +59,7 @@ void assert_equivalent(hdl::Module& module,
   
   z3::check_result result = solver.check();
   if (result == z3::sat) {
+    std::cout << solver << std::endl;
     for (hdl::Value* input : inputs) {
       std::cout << builder.interp(solver, input) << ", " << builder.interp(solver, input).popcount() << std::endl;
     }
@@ -86,8 +87,11 @@ int main(int argc, const char** argv) {
     
     hdl::Value* ret_a = trace(module, globals, llvm_module->getFunction("abs_1"), {x});
     hdl::Value* ret_b = trace(module, globals, llvm_module->getFunction("abs_2"), {x});
+    hdl::Value* ret_c = trace(module, globals, llvm_module->getFunction("abs_3"), {x});
     
     assert_equivalent(module, {x}, ret_a, ret_b);
+    assert_equivalent(module, {x}, ret_a, ret_c);
+    assert_equivalent(module, {x}, ret_b, ret_c);
   });
   
   Test("parity").run([&](){
@@ -107,9 +111,8 @@ int main(int argc, const char** argv) {
     hdl::Value* ret_4 = trace(module, globals, llvm_module->getFunction("parity_4"), {x});
     assert_equivalent(module, {x}, ret_1, ret_4);
     
-    // TODO
-    // hdl::Value* ret_5 = trace(module, globals, llvm_module->getFunction("parity_5"), {x});
-    // assert_equivalent(module, {x}, ret_1, ret_5);
+    hdl::Value* ret_5 = trace(module, globals, llvm_module->getFunction("parity_5"), {x});
+    assert_equivalent(module, {x}, ret_1, ret_5);
     
   });
   
@@ -126,6 +129,9 @@ int main(int argc, const char** argv) {
     assert_equivalent(module, {x}, ret_1, ret_2);
     assert_equivalent(module, {x}, ret_2, ret_3);
     assert_equivalent(module, {x}, ret_1, ret_3);
+    
+    hdl::Value* ret_4 = trace(module, globals, llvm_module->getFunction("popcount_4"), {x});
+    assert_equivalent(module, {x}, ret_1, ret_4);
   });
   
   Test("swap").run([&](){
@@ -188,19 +194,19 @@ int main(int argc, const char** argv) {
     
     hdl::Value* ret_1 = trace(module, globals, llvm_module->getFunction("sum_1"), {values, size});
     hdl::Value* ret_2 = trace(module, globals, llvm_module->getFunction("sum_2"), {values, size});
-    // TODO: hdl::Value* ret_3 = trace(module, globals, llvm_module->getFunction("sum_3"), {values, size});
+    hdl::Value* ret_3 = trace(module, globals, llvm_module->getFunction("sum_3"), {values, size});
     
     assert_equivalent(module, inputs, ret_1, ret_2);
-    // TODO: assert_equivalent(module, inputs, ret_1, ret_3);
-    // TODO: assert_equivalent(module, inputs, ret_2, ret_3);
+    assert_equivalent(module, inputs, ret_1, ret_3);
+    assert_equivalent(module, inputs, ret_2, ret_3);
   });
   
   Test("sort").run([&](){
     hdl::Module module("top");
     pathbeaver::Globals globals(module, &*llvm_module);
     
-    hdl::Value* size = module.constant(hdl::BitString::from_uint(uint32_t(5)));
-    hdl::Unknown* values = globals.initial_memory().alloc(module.constant(hdl::BitString::from_uint(uint64_t(5 * 4))));
+    hdl::Value* size = module.constant(hdl::BitString::from_uint(uint32_t(3)));
+    hdl::Unknown* values = globals.initial_memory().alloc(module.constant(hdl::BitString::from_uint(uint64_t(3 * 4))));
     
     std::set<hdl::Value*> inputs;
     for (hdl::Value* byte : globals.initial_memory().load_bytes(values)) {
@@ -221,7 +227,7 @@ int main(int argc, const char** argv) {
     {
       pathbeaver::Trace initial_trace(module, globals);
       initial_trace.call(llvm_module->getFunction("sort_2_is_sorted"), {values, size});
-      pathbeaver::Trace merged = pathbeaver::Trace::merge(initial_trace.trace()).value(); // TODO
+      pathbeaver::Trace merged = initial_trace.trace_recursive();
       merged.exceptions().ensure_none_occur(inputs);
       is_sorted_2 = merged.toplevel_return_value().primitive();
     }

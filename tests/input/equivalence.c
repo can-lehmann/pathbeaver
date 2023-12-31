@@ -17,11 +17,19 @@
 #include <stdbool.h>
 
 int64_t abs_1(int64_t x) {
-  return x < 0 ? -x : x;
+  if (x < 0) {
+    return -x;
+  } else {
+    return x;
+  }
 }
 
 int64_t abs_2(int64_t x) {
   return (x ^ (x >> 63)) + ((x >> 63) & 1);
+}
+
+int64_t abs_3(int64_t x) {
+  return x < 0 ? -x : x;
 }
 
 bool parity_1(uint16_t x) {
@@ -81,7 +89,7 @@ bool parity_5(uint16_t x) {
   y <<= 64 - 16;
   bool parity = false;
   for (size_t it = 0; it < sizeof(y) * 8; it++) {
-    if (y & (1 << it)) {
+    if (y & (1UL << it)) {
       parity = !parity;
     }
   }
@@ -116,6 +124,19 @@ int popcount_3(uint16_t x) {
   x = (x & 0x0f0f) + ((x >> 4) & 0x0f0f);
   uint8_t* vals = (uint8_t*)&x;
   return vals[0] + vals[1];
+}
+
+int popcount_4_rec(uint16_t x, size_t size) {
+  if (size == 1) {
+    return x & 1;
+  } else {
+    size_t half = size >> 1;
+    return popcount_4_rec(x, half) + popcount_4_rec(x >> half, half);
+  }
+}
+
+int popcount_4(uint16_t x) {
+  return popcount_4_rec(x, sizeof(x) * 8);
 }
 
 void swap_1(int32_t* a, int32_t* b) {
@@ -206,6 +227,25 @@ bool sort_1_is_sorted(int32_t* values, uint32_t size) {
 bool sort_2_is_sorted(int32_t* values, uint32_t size) {
   sort_2(values, size);
   return is_sorted(values, size);
+}
+
+void subst_1_apply(uint8_t* message, uint32_t size, uint8_t* table) {
+  for (size_t it = 0; it < size; it++) {
+    message[it] = table[message[it]];
+  }
+}
+
+void subst_1_invert_table(uint8_t* table, uint8_t* inv_table) {
+  for (size_t it = 0; it < 256; it++) {
+    inv_table[table[it]] = it;
+  }
+}
+
+void subst_1(uint8_t* message, uint32_t size, uint8_t* table) {
+  uint8_t inv_table[256];
+  subst_1_apply(message, size, table);
+  subst_1_invert_table(table, inv_table);
+  subst_1_apply(message, size, inv_table);
 }
 
 void binstr_wrong_1(char* str, size_t size, uint64_t value) {

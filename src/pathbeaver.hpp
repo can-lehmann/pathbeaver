@@ -1407,6 +1407,19 @@ namespace pathbeaver {
       return trace;
     }
     
+    Value trace_simple(llvm::Function* function,
+                       const std::vector<Value>& args) {
+      pathbeaver::Trace trace = *this;
+      trace.call(function, args);
+      pathbeaver::Trace merged = trace.trace_recursive();
+      std::set<hdl::Value*> inputs;
+      for (const Value& value : args) {
+        inputs.insert(value.primitive());
+      }
+      merged.exceptions().ensure_none_occur(inputs);
+      return merged.toplevel_return_value();
+    }
+    
     bool merge_inplace(const Trace& other) {
       if (_stack.size() != other._stack.size()) {
         return false;

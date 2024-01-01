@@ -21,9 +21,11 @@
 
 #include <z3++.h>
 
-#include "pathbeaver.hpp"
+#include "../../src/pathbeaver.hpp"
 
-#include "../modules/hdl.cpp/hdl_proof_z3.hpp"
+#include "../../modules/hdl.cpp/hdl_proof.hpp"
+#include "../../modules/hdl.cpp/hdl_proof_z3.hpp"
+#include "../../modules/hdl.cpp/hdl_flatten.hpp"
 
 int main(int argc, const char** argv) {
   if (argc != 2) {
@@ -36,34 +38,13 @@ int main(int argc, const char** argv) {
   std::unique_ptr<llvm::Module> llvm_module = llvm::parseIRFile(argv[1], error, llvm_context);
   
   hdl::Module module("top");
+  pathbeaver::Globals globals(module, &*llvm_module);
   
   hdl::Value* x = module.input("x", 32);
   
-  hdl::Value* ret_a = nullptr;
-  hdl::Value* ret_b = nullptr;
-  
-  {
-    llvm::Function* function = llvm_module->getFunction("popcount_simple");
-    pathbeaver::Trace initial_trace = pathbeaver::Trace::call(module, function, {x});
-    pathbeaver::Trace merged = initial_trace.trace_recursive();
-    //std::vector<pathbeaver::Trace> traces = initial_trace.trace();
-    //pathbeaver::Trace merged = pathbeaver::Trace::merge(traces).value();
-    ret_a = merged.toplevel_return_value().primitive();
-    module.output("popcount_simple", ret_a);
-  }
-  
-  {
-    llvm::Function* function = llvm_module->getFunction("popcount_fast");
-    pathbeaver::Trace initial_trace = pathbeaver::Trace::call(module, function, {x});
-    pathbeaver::Trace merged = initial_trace.trace_recursive();
-    //std::vector<pathbeaver::Trace> traces = initial_trace.trace();
-    //pathbeaver::Trace merged = pathbeaver::Trace::merge(traces).value();
-    ret_b = merged.toplevel_return_value().primitive();
-    module.output("popcount_fast", ret_b);
-  }
-  
-  hdl::graphviz::Printer printer(module);
-  printer.save("graph.gv");
+  pathbeaver::Trace trace(module, globals);
+  pathbeaver::Value ret_a = trace.trace_simple(llvm_module->getFunction("popcount_simple"), {x});
+  pathbeaver::Value ret_b = trace.trace_simple(llvm_module->getFunction("popcount_fast"), {x});
   
   z3::context context;
   z3::solver solver(context);
@@ -72,7 +53,9 @@ int main(int argc, const char** argv) {
   builder.free(x);
   builder.require(
     solver,
-    module.op(hdl::Op::Kind::Eq, {ret_a, ret_b}),
+    module.op(hdl::Op::Kind::Eq, {
+      ret_a.primitive(), ret_b.primitive()
+    }),
     hdl::BitString::from_bool(false)
   );
   

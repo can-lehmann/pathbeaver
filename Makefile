@@ -1,8 +1,3 @@
-all: bin/pathbeaver
-
-bin/pathbeaver: src/pathbeaver.hpp src/main.cpp
-	clang++ -g -I/usr/include/z3 -lz3 `llvm-config-16 --cflags --libs` src/main.cpp -o bin/pathbeaver
-
 test: tests/test_exceptions tests/input/exceptions.bc tests/test_equivalence tests/input/equivalence.bc tests/input/equivalence_o1.bc tests/input/equivalence_o2.bc tests/input/equivalence_o3.bc
 	./tests/test_exceptions tests/input/exceptions.bc
 	./tests/test_equivalence tests/input/equivalence.bc

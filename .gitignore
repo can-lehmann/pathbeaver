@@ -1,5 +1,6 @@
 bin/*
 !bin/.empty
+examples/*/main
 examples/*/*.bc
 examples/*/*.ll
 examples/*/*.svg

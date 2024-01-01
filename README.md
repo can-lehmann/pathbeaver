@@ -32,7 +32,10 @@ If you are interested in collaborating on projects involving pathbeaver, feel fr
 Pathbeaver requires LLVM 16 and the Z3 theorem prover.
 
 ```bash
-TODO
+$ git clone https://github.com/can-lehmann/pathbeaver.git
+$ cd pathbeaver
+$ git submodule update --init
+$ make test
 ```
 
 ## Documentation

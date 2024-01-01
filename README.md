@@ -20,8 +20,43 @@ int64_t abs_2(int64_t x) {
 }
 ```
 
+We use pathbeaver to execute both functions on a symbolic input.
+
+```cpp
+hdl::Value* x = module.input("x", 64);
+
+pathbeaver::Trace trace(module, globals);
+pathbeaver::Value ret_a = trace.trace_simple(llvm_module->getFunction("abs_1"), {x});
+pathbeaver::Value ret_b = trace.trace_simple(llvm_module->getFunction("abs_2"), {x});
+```
+
+Then we prove the equivalence of the resulting traces using Z3:
+
+```cpp
+z3::context context;
+z3::solver solver(context);
+hdl::proof::z3::Builder builder(context);
+
+builder.free(x);
+builder.require(
+  solver,
+  module.op(hdl::Op::Kind::Eq, {
+    ret_a.primitive(), ret_b.primitive()
+  }),
+  hdl::BitString::from_bool(false)
+);
+
+std::cout << solver.check() << std::endl;
+```
+
+Running this outputs
+
 ```bash
-TODO
+$ make
+clang++ -g -I/usr/include/z3 -lz3 `llvm-config-16 --cflags --libs` main.cpp -o main
+clang -Xclang -disable-O0-optnone -c -emit-llvm -o abs.bc abs.c
+./main abs.bc
+unsat
 ```
 
 **Note:** Pathbeaver is currently a hobby project and should not be used for important applications.

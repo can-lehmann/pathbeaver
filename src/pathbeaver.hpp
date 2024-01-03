@@ -61,6 +61,16 @@ namespace pathbeaver {
     }
     return bit_string;
   }
+  
+  inline llvm::APInt bit_string_to_ap_int(const hdl::BitString& bit_string) {
+    llvm::APInt ap_int = llvm::APInt::getZero(bit_string.width());
+    for (size_t it = 0; it < bit_string.width(); it++) {
+      if (bit_string[it]) {
+        ap_int.setBit(it);
+      }
+    }
+    return ap_int;
+  }
 
   class Error: public std::runtime_error {
     using std::runtime_error::runtime_error;
@@ -69,17 +79,22 @@ namespace pathbeaver {
   class Value {
   public:
     enum class Kind {
-      Primitive, Array
+      Primitive, Array, Vector
     };
     
     struct Array: public std::vector<Value> {
       using std::vector<Value>::vector;
     };
+    
+    struct Vector: public std::vector<hdl::Value*> {
+      using std::vector<hdl::Value*>::vector;
+    };
   private:
-    std::variant<hdl::Value*, Array> _value;
+    std::variant<hdl::Value*, Array, Vector> _value;
   public:
     Value(hdl::Value* value): _value(value) {}
     Value(const Array& value): _value(value) {}
+    Value(const Vector& value): _value(value) {}
     
   private:
     static hdl::Value* prop_concat(hdl::Value* high, hdl::Value* low, hdl::Module& module) {
@@ -128,6 +143,27 @@ namespace pathbeaver {
             module.constant(hdl::BitString::from_uint(bit_width))
           });
         }
+      } else if (llvm_match(FixedVectorType, fixed_vector_type, type)) {
+        size_t size = fixed_vector_type->getNumElements();
+        size_t element_width = fixed_vector_type->getElementType()->getPrimitiveSizeInBits();
+        
+        Vector vector;
+        vector.reserve(size);
+        for (size_t it = 0; it < size; it++) {
+          size_t offset = 0;
+          if (data_layout.isLittleEndian()) {
+            offset = element_width * it;
+          } else {
+            offset = element_width * (size - it - 1);
+          }
+          
+          vector.push_back(module.op(hdl::Op::Kind::Slice, {
+            value,
+            module.constant(hdl::BitString::from_uint(offset)),
+            module.constant(hdl::BitString::from_uint(element_width))
+          }));
+        }
+        return Value(vector);
       }
       return Value(value);
     }
@@ -135,6 +171,7 @@ namespace pathbeaver {
     Kind kind() const { return Kind(_value.index()); }
     hdl::Value* primitive() const { return std::get<hdl::Value*>(_value); }
     const Array& array() const { return std::get<Array>(_value); }
+    const Vector& vector() const { return std::get<Vector>(_value); }
     
     std::map<size_t, hdl::Value*> to_bytes(llvm::Type* type,
                                            const llvm::DataLayout& data_layout,
@@ -185,6 +222,20 @@ namespace pathbeaver {
               module
             );
           }
+        }
+        break;
+        case Kind::Vector: {
+          hdl::Value* value = vector()[0];
+          for (size_t it = 1; it < vector().size(); it++) {
+            hdl::Value* element = vector()[it];
+            if (!data_layout.isLittleEndian()) {
+              value = module.op(hdl::Op::Kind::Concat, {value, element});
+            } else {
+              value = module.op(hdl::Op::Kind::Concat, {element, value});
+            }
+          }
+          
+          Value(value).to_bytes(type, layout, offset, data_layout, module);
         }
         break;
         default:
@@ -733,6 +784,18 @@ namespace pathbeaver {
           array.push_back((*this)[constant_data_array->getElementAsConstant(it)]);
         }
         return array;
+      } else if (llvm_match(ConstantAggregateZero, constant_aggregate_zero, constant)) {
+        if (constant_aggregate_zero->getType()->isVectorTy()) {
+          Value::Vector vector;
+          size_t size = constant_aggregate_zero->getElementCount().getKnownMinValue();
+          vector.reserve(size);
+          for (size_t it = 0; it < size; it++) {
+            vector.push_back((*this)[constant_aggregate_zero->getElementValue(it)].primitive());
+          }
+          return vector;
+        } else {
+          throw_error(Error, "Unknown constant");
+        }
       } else if (llvm_match(GlobalVariable, global_variable, constant)) {
         return _variables.at(global_variable);
       } else if (llvm_match(Function, function, constant)) {
@@ -744,6 +807,29 @@ namespace pathbeaver {
           _unknown_to_function.insert({unknown, function});
         }
         return _functions.at(function);
+      } else if (llvm_match(UndefValue, undef_value, constant)) {
+        if (llvm_match(FixedVectorType, fixed_vector_type, undef_value->getType())) {
+          size_t size = fixed_vector_type->getNumElements();
+          size_t element_width = fixed_vector_type->getElementType()->getPrimitiveSizeInBits();
+          
+          Value::Vector vector;
+          vector.reserve(size);
+          for (size_t it = 0; it < size; it++) {
+            vector.push_back(_module.unknown(element_width));
+          }
+          return vector;
+        } else {
+          size_t size = undef_value->getType()->getPrimitiveSizeInBits();
+          return _module.unknown(size);
+        }
+      } else if (llvm_match(ConstantData, constant_data, constant)) {
+        constant->print(llvm::outs());
+        llvm::outs() << '\n';
+        throw_error(Error, "Unknown constant data");
+      } else if (llvm_match(ConstantExpr, constant_expr, constant)) {
+        constant->print(llvm::outs());
+        llvm::outs() << '\n';
+        throw_error(Error, "Unknown constant expr");
       } else {
         constant->print(llvm::outs());
         llvm::outs() << '\n';
@@ -920,6 +1006,7 @@ namespace pathbeaver {
       switch (opcode) {
         case llvm::Instruction::Add: return _module.op(hdl::Op::Kind::Add, {a, b}); break;
         case llvm::Instruction::Sub: return _module.op(hdl::Op::Kind::Sub, {a, b}); break;
+        case llvm::Instruction::Mul: return mul(a, b); break;
         case llvm::Instruction::And: return _module.op(hdl::Op::Kind::And, {a, b}); break;
         case llvm::Instruction::Or: return _module.op(hdl::Op::Kind::Or, {a, b}); break;
         case llvm::Instruction::Xor: return _module.op(hdl::Op::Kind::Xor, {a, b}); break;
@@ -935,8 +1022,27 @@ namespace pathbeaver {
       StackFrame& frame = _stack.back();
       Value a = frame[binop->getOperand(0)];
       Value b = frame[binop->getOperand(1)];
-      hdl::Value* result = trace_binop(binop->getOpcode(), a.primitive(), b.primitive());
-      frame.set(binop, Value(result));
+      switch (a.kind()) {
+        case Value::Kind::Primitive: {
+          hdl::Value* result = trace_binop(binop->getOpcode(), a.primitive(), b.primitive());
+          frame.set(binop, Value(result));
+        }
+        break;
+        case Value::Kind::Vector: {
+          Value::Vector result;
+          for (size_t it = 0; it < a.vector().size(); it++) {
+            result.push_back(trace_binop(
+              binop->getOpcode(),
+              a.vector()[it],
+              b.vector()[it]
+            ));
+          }
+          frame.set(binop, Value(result));
+        }
+        break;
+        default:
+          throw_error(Error, "Binary operator implemented for value kind");
+      }
     }
     
     hdl::Value* trace_cmp(llvm::CmpInst::Predicate predicate, hdl::Value* a, hdl::Value* b) {
@@ -1028,6 +1134,16 @@ namespace pathbeaver {
       }
     }
     
+    std::optional<hdl::Op::Kind> is_simple_vector_reduce(llvm::Intrinsic::ID id) {
+      switch (id) {
+        case llvm::Intrinsic::vector_reduce_add: return hdl::Op::Kind::Add; break;
+        case llvm::Intrinsic::vector_reduce_and: return hdl::Op::Kind::And; break;
+        case llvm::Intrinsic::vector_reduce_or: return hdl::Op::Kind::Or; break;
+        case llvm::Intrinsic::vector_reduce_xor: return hdl::Op::Kind::Xor; break;
+        default: return {};
+      }
+    }
+    
     void trace_intrinsic(llvm::IntrinsicInst* intrinsic) {
       StackFrame& frame = _stack.back();
       
@@ -1091,6 +1207,13 @@ namespace pathbeaver {
           _module.op(hdl::Op::Kind::Sub, {zero, a}),
           a
         }));
+      } else if (std::optional<hdl::Op::Kind> kind = is_simple_vector_reduce(intrinsic->getIntrinsicID())) {
+        Value::Vector vector = frame[intrinsic->getArgOperand(0)].vector();
+        hdl::Value* acc = vector[0];
+        for (size_t it = 1; it < vector.size(); it++) {
+          acc = _module.op(kind.value(), { acc, vector[it] });
+        }
+        frame.set(intrinsic, acc);
       } else {
         throw_error(Error, "Intrinsic " << intrinsic->getCalledFunction()->getName().str() << " is not implemented");
       }
@@ -1257,6 +1380,53 @@ namespace pathbeaver {
           }
           
           frame.set(load, Value::from_bytes(type, data_layout, bytes, _module));
+          _stack.back().next();
+        } else if (llvm_match(InsertElementInst, insert_element, inst)) {
+          StackFrame& frame = _stack.back();
+          Value::Vector vector = frame[insert_element->getOperand(0)].vector();
+          hdl::Value* element = frame[insert_element->getOperand(1)].primitive();
+          hdl::Constant* index = dynamic_cast<hdl::Constant*>(frame[insert_element->getOperand(2)].primitive());
+          if (index == nullptr) {
+            throw_error(Error, "Index of " << inst->getOpcodeName() << " must be constant");
+          }
+          vector[index->value.as_uint64()] = element;
+          frame.set(insert_element, Value(vector));
+          _stack.back().next();
+        } else if (llvm_match(ExtractElementInst, extract_element, inst)) {
+          StackFrame& frame = _stack.back();
+          Value::Vector vector = frame[extract_element->getVectorOperand()].vector();
+          hdl::Constant* index = dynamic_cast<hdl::Constant*>(frame[extract_element->getIndexOperand()].primitive());
+          if (index == nullptr) {
+            throw_error(Error, "Index of " << inst->getOpcodeName() << " must be constant");
+          }
+          frame.set(extract_element, vector[index->value.as_uint64()]);
+          _stack.back().next();
+        } else if (llvm_match(ShuffleVectorInst, shuffle_vector, inst)) {
+          StackFrame& frame = _stack.back();
+          Value::Vector a = frame[shuffle_vector->getOperand(0)].vector();
+          Value::Vector b = frame[shuffle_vector->getOperand(1)].vector();
+          
+          llvm_match(FixedVectorType, fixed_vector_type, inst->getType());
+          if (fixed_vector_type == nullptr) {
+            throw_error(Error, inst->getOpcodeName() << " must return a vector type");
+          }
+          size_t element_width = fixed_vector_type->getElementType()->getPrimitiveSizeInBits();
+          
+          Value::Vector result;
+          result.reserve(shuffle_vector->getShuffleMask().size());
+          for (int index : shuffle_vector->getShuffleMask()) {
+            if (index == -1) {
+              result.push_back(_module.unknown(element_width));
+            } else if (index < a.size()) {
+              result.push_back(a[index]);
+            } else if (index < a.size() + b.size()) {
+              result.push_back(b[index - a.size()]);
+            } else {
+              throw_error(Error, "Vector index out of bounds");
+            }
+          }
+          frame.set(shuffle_vector, Value(result));
+          
           _stack.back().next();
         } else if (llvm_match(BinaryOperator, binop, inst)) {
           trace_binop(binop);

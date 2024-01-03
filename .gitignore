@@ -7,5 +7,7 @@ examples/*/*.svg
 examples/*/*.gv
 tests/input/*.bc
 tests/input/*.ll
+!tests/input/execution_*.ll
 tests/test_equivalence
 tests/test_exceptions
+tests/test_execution

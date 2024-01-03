@@ -199,6 +199,14 @@ int main(int argc, const char** argv) {
     assert_equivalent(module, inputs, ret_1, ret_2);
     assert_equivalent(module, inputs, ret_1, ret_3);
     assert_equivalent(module, inputs, ret_2, ret_3);
+    
+    hdl::Value* ret_4 = trace(module, globals, llvm_module->getFunction("sum_4"), {values, size});
+    
+    assert_equivalent(module, inputs, ret_1, ret_4);
+    
+    hdl::Value* ret_5 = trace(module, globals, llvm_module->getFunction("sum_5"), {values, size});
+    
+    assert_equivalent(module, inputs, ret_1, ret_5);
   });
   
   Test("sort").run([&](){
@@ -233,6 +241,54 @@ int main(int argc, const char** argv) {
     }
     assert_equivalent(module, inputs, is_sorted_2, module.constant(hdl::BitString::from_bool(true)));
     
+  });
+  
+  Test("matmul").run([&](){
+    hdl::Module module("top");
+    pathbeaver::Globals globals(module, &*llvm_module);
+    
+    uint32_t h = 2;
+    uint32_t w = 5;
+    uint32_t d = 3;
+    
+    hdl::Value* h_val = module.constant(hdl::BitString::from_uint(h));
+    hdl::Value* w_val = module.constant(hdl::BitString::from_uint(w));
+    hdl::Value* d_val = module.constant(hdl::BitString::from_uint(d));
+    
+    hdl::Unknown* a = globals.initial_memory().alloc(module.constant(hdl::BitString::from_uint(uint64_t(h * d * 4))));
+    hdl::Unknown* b = globals.initial_memory().alloc(module.constant(hdl::BitString::from_uint(uint64_t(d * w * 4))));
+    hdl::Unknown* c = globals.initial_memory().alloc(module.constant(hdl::BitString::from_uint(uint64_t(h * w * 4))));
+    
+    hdl::Value* matmul_1 = nullptr;
+    hdl::Value* matmul_2 = nullptr;
+    hdl::Value* matmul_3 = nullptr;
+    
+    {
+      pathbeaver::Trace initial_trace(module, globals);
+      initial_trace.call(llvm_module->getFunction("matmul_1"), {a, b, c, h_val, w_val, d_val});
+      pathbeaver::Trace merged = initial_trace.trace_recursive();
+      merged.exceptions().ensure_none_occur({});
+      matmul_1 = merged.memory().load_all(c);
+    }
+    
+    {
+      pathbeaver::Trace initial_trace(module, globals);
+      initial_trace.call(llvm_module->getFunction("matmul_2"), {a, b, c, h_val, w_val, d_val});
+      pathbeaver::Trace merged = initial_trace.trace_recursive();
+      merged.exceptions().ensure_none_occur({});
+      matmul_2 = merged.memory().load_all(c);
+    }
+    
+    {
+      pathbeaver::Trace initial_trace(module, globals);
+      initial_trace.call(llvm_module->getFunction("matmul_3"), {a, b, c, h_val, w_val, d_val});
+      pathbeaver::Trace merged = initial_trace.trace_recursive();
+      merged.exceptions().ensure_none_occur({});
+      matmul_3 = merged.memory().load_all(c);
+    }
+    
+    assert_equivalent(module, {}, matmul_1, matmul_2);
+    assert_equivalent(module, {}, matmul_1, matmul_3);
   });
   
   return 0;

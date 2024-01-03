@@ -185,6 +185,50 @@ int32_t sum_3(int32_t* values, uint32_t size) {
   }
 }
 
+int32_t sum_4(int32_t* values, uint32_t size) {
+  typedef int32_t int32x4_t __attribute__((ext_vector_type(4)));
+  // TODO: Alignment
+  
+  int32_t sum = 0;
+  uint32_t it = 0;
+  while (it + 4 <= size) {
+    int32x4_t vec = *(int32x4_t*)(values + it);
+    sum += __builtin_reduce_add(vec);
+    it += 4;
+  }
+  
+  while (it < size) {
+    sum += values[it];
+    it++;
+  }
+  
+  return sum;
+}
+
+int32_t sum_5(int32_t* values, uint32_t size) {
+  typedef int32_t int32x4_t __attribute__((ext_vector_type(4)));
+  // TODO: Alignment
+  
+  int32_t sum = 0;
+  uint32_t it = 0;
+  while (it + 4 <= size) {
+    int32x4_t vec;
+    vec.x = values[it];
+    vec.y = values[it + 1];
+    vec.z = values[it + 2];
+    vec.w = values[it + 3];
+    sum += vec.x + vec.y + vec.z + vec.w;
+    it += 4;
+  }
+  
+  while (it < size) {
+    sum += values[it];
+    it++;
+  }
+  
+  return sum;
+}
+
 bool is_sorted(int32_t* values, uint32_t size) {
   for (uint32_t it = 0; it + 1 < size; it++) {
     if (values[it] > values[it + 1]) {
@@ -227,6 +271,54 @@ bool sort_1_is_sorted(int32_t* values, uint32_t size) {
 bool sort_2_is_sorted(int32_t* values, uint32_t size) {
   sort_2(values, size);
   return is_sorted(values, size);
+}
+
+void matmul_1(int32_t* a, int32_t* b, int32_t* c,
+              uint32_t h, uint32_t w, uint32_t d) {
+  for (uint32_t y = 0; y < h; y++) {
+    for (uint32_t x = 0; x < w; x++) {
+      int32_t sum = 0;
+      for (uint32_t it = 0; it < d; it++) {
+        sum += a[y * d + it] * b[it * w + x];
+      }
+      c[y * w + x] = sum;
+    }
+  }
+}
+
+void matmul_2(int32_t* a, int32_t* b, int32_t* c,
+              uint32_t h, uint32_t w, uint32_t d) {
+  for (uint32_t y = 0; y < h; y++) {
+    for (uint32_t x = 0; x < w; x++) {
+      c[y * w + x] = 0;
+    }
+  }
+  
+  for (uint32_t y = 0; y < h; y++) {
+    for (uint32_t it = 0; it < d; it++) {
+      for (uint32_t x = 0; x < w; x++) {
+        c[y * w + x] += a[y * d + it] * b[it * w + x];
+      }
+    }
+  }
+}
+
+void matmul_3(int32_t* a, int32_t* b, int32_t* c,
+              uint32_t h, uint32_t w, uint32_t d) {
+  for (uint32_t y = 0; y < h; y++) {
+    for (uint32_t x = 0; x < w; x++) {
+      c[y * w + x] = 0;
+    }
+  }
+  
+  for (uint32_t y = 0; y < h; y++) {
+    for (uint32_t it = 0; it < d; it++) {
+      #pragma clang loop vectorize(enable)
+      for (uint32_t x = 0; x < w; x++) {
+        c[y * w + x] += a[y * d + it] * b[it * w + x];
+      }
+    }
+  }
 }
 
 void subst_1_apply(uint8_t* message, uint32_t size, uint8_t* table) {
